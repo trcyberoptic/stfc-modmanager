@@ -270,6 +270,71 @@ internal static class SelfTest
         Eq(AppState.DeserializeFrom("""{"TrustedRepos":[null]}""").TrustedRepos.Count, 0,
            "state: a null element inside TrustedRepos is dropped, not kept as null");
 
+        // --- Installer: Referenzzaehlung fuer geteilte Bibliotheken (Spec §6.4) ---
+        var shState = new AppState();
+        Installer.RegisterShared(shState, @"BepInEx\plugins\Newtonsoft.Json.dll", "aa", "13.0.3", "modA");
+        Installer.RegisterShared(shState, @"BepInEx\plugins\Newtonsoft.Json.dll", "aa", "13.0.3", "modB");
+        Eq(shState.SharedFiles.Count, 1, "shared: one record for two providers");
+        Eq(shState.SharedFiles[0].Providers.Count, 2, "shared: two providers");
+
+        Eq(Installer.ReleaseShared(shState, @"BepInEx\plugins\Newtonsoft.Json.dll", "modA"), false,
+           "shared: file survives while another mod needs it");
+        Eq(Installer.ReleaseShared(shState, @"BepInEx\plugins\Newtonsoft.Json.dll", "modB"), true,
+           "shared: file is deletable once the last provider goes");
+        Eq(shState.SharedFiles.Count, 0, "shared: record removed with the last provider");
+        Eq(Installer.ReleaseShared(shState, @"BepInEx\plugins\Unknown.dll", "modA"), true,
+           "shared: unknown file is deletable");
+
+        // Registrierung mit hoeherer Dateiversion gewinnt
+        var vState = new AppState();
+        Installer.RegisterShared(vState, @"BepInEx\plugins\X.dll", "aa", "1.0.0", "modA");
+        Installer.RegisterShared(vState, @"BepInEx\plugins\X.dll", "bb", "2.0.0", "modB");
+        Eq(vState.SharedFiles[0].FileVersion, "2.0.0", "shared: higher file version wins");
+
+        // --- Installer.Remove: SharedFiles-Eintraege eines Mods werden mitentfernt (Pre-Flight-Review) ---
+        // Remove() sah urspruenglich nur mod.Files vor -- Dateien, die ein Mod zusaetzlich in
+        // state.SharedFiles mit sich selbst als Anbieter eintraegt (z. B. mitgelieferte
+        // Abhaengigkeiten), blieben beim Deinstallieren fuer immer als "SharedFile" bestehen.
+        // Ein nicht existierender Spielordner haelt diese Pruefung rein bei der Buchhaltung:
+        // File.Exists liefert dafuer zuverlaessig false, File.Delete wird nie erreicht.
+        var rmGame = new GameInstall(Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-nonexistent-{Guid.NewGuid():N}"));
+
+        var rmState = new AppState();
+        var rmMod = new ModEntry
+        {
+            Id = "modA", Name = "A", Version = "1.0",
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\A.dll", Sha256 = "aa" } }
+        };
+        rmState.Mods.Add(rmMod);
+        Installer.RegisterShared(rmState, @"BepInEx\plugins\Shared.dll", "bb", "1.0.0", "modA");
+        Installer.RegisterShared(rmState, @"BepInEx\plugins\Shared.dll", "bb", "1.0.0", "modB");
+
+        Installer.Remove(rmState, rmGame, rmMod);
+        Eq(rmState.Mods.Count, 0, "remove: mod itself is dropped from state.Mods");
+        Eq(rmState.SharedFiles.Count, 1, "remove: shared file survives while modB still needs it");
+        Eq(rmState.SharedFiles[0].Providers.Count, 1, "remove: modA's provider entry is gone from the shared file");
+        Eq(rmState.SharedFiles[0].Providers[0], "modB", "remove: remaining provider is modB");
+
+        // Wenn modC der letzte Anbieter ist, verschwindet der SharedFiles-Eintrag komplett --
+        // genau die Regel, die ReleaseShared fuer sich alleine schon garantiert.
+        var rmState2 = new AppState();
+        var rmMod2 = new ModEntry { Id = "modC", Name = "C", Version = "1.0" };
+        rmState2.Mods.Add(rmMod2);
+        Installer.RegisterShared(rmState2, @"BepInEx\plugins\Solo.dll", "cc", "1.0.0", "modC");
+        Installer.Remove(rmState2, rmGame, rmMod2);
+        Eq(rmState2.SharedFiles.Count, 0, "remove: shared file with no remaining providers is dropped entirely");
+
+        // --- Installer.SetEnabled: native-Zweig darf nie werfen, wenn keine der beiden Dateien existiert ---
+        var nativeGame = new GameInstall(Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-nonexistent-{Guid.NewGuid():N}"));
+        var nativeMod = new ModEntry
+        {
+            Id = "CommunityPatch", Name = "Community Patch", Version = "1.0",
+            SourceKind = "native", Enabled = false
+        };
+        Installer.SetEnabled(nativeGame, nativeMod, true);
+        Eq(nativeMod.Enabled, true,
+           "SetEnabled: native toggle with neither version.dll nor version.dll_ present does not throw and still flips Enabled");
+
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
     }
