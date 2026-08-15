@@ -177,6 +177,38 @@ internal static class SelfTest
         Check(PackageMapper.MapArchive(missingZip).Rejection is not null,
               "map: MapArchive rejects rather than throws when the archive file cannot be opened");
 
+        // --- PackageMapper: Fix Round 2 ---
+        // Ein Eintrag, der nur aus "." besteht, muss uebersprungen werden, ohne abgelehnt zu werden
+        // und ohne abzustuerzen: Segments("") liefert ein leeres Array, und MapLoose(parts[^1]) wuerde
+        // sonst mit IndexOutOfRangeException in genau den Absturz laufen, den Fix Round 1 (F2) fuer
+        // MapArchive schliessen sollte -- hier reintroduziert ueber unvertrauten Archivinhalt.
+        // ". " landet nach dem Trim() ganz oben in der Schleife ebenfalls bei ".".
+        var rDotOnly = PackageMapper.MapEntries(new[] { ".", "MyMod.dll" });
+        Eq(rDotOnly.Rejection, null, "map: a \".\" entry is skipped, not rejected, and does not throw");
+        Eq(rDotOnly.Files.Count, 1, "map: a \".\" entry contributes no file of its own");
+
+        var rDotSpaceOnly = PackageMapper.MapEntries(new[] { ". ", "MyMod.dll" });
+        Eq(rDotSpaceOnly.Rejection, null, "map: a \". \" entry (trims to \".\") is skipped and does not throw");
+        Eq(rDotSpaceOnly.Files.Count, 1, "map: a \". \" entry contributes no file of its own");
+
+        // Auch als einziger Eintrag darf "." nicht abstuerzen -- hier bleibt am Ende schlicht nichts
+        // Installierbares uebrig, was die schon vorher bestehende, andere Ablehnung ist.
+        Check(PackageMapper.MapEntries(new[] { "." }).Rejection is not null,
+              "map: an archive containing only \".\" has nothing installable, and does not throw");
+
+        // Ein eingebettetes "./"-Segment darf die Kollisionspruefung nicht umgehen: vor der
+        // Zielpfad-Berechnung wird "." jetzt entfernt, nicht nur von der Traversal-Pruefung
+        // ausgenommen, also erzeugen beide Eintraege denselben Zielpfad-String.
+        Check(PackageMapper.MapEntries(new[] { "BepInEx/plugins/A.dll", "BepInEx/./plugins/A.dll" }).Rejection is not null,
+              "map: rejects a target collision hidden behind an embedded \".\" segment");
+
+        // Ein eingebettetes "./"-Segment in einem sonst harmlosen losen Pfad darf weder abgelehnt
+        // werden noch im Zielpfad als woertliches "." landen (sonst BepInEx\plugins\. o.ae.).
+        var rEmbeddedDot = PackageMapper.MapEntries(new[] { "MyMod/./A.dll" });
+        Eq(rEmbeddedDot.Rejection, null, "map: an embedded \"./\" segment does not cause rejection");
+        Eq(rEmbeddedDot.Files[0].Target, @"BepInEx\plugins\A.dll",
+           "map: an embedded \"./\" segment is dropped before target computation");
+
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
     }

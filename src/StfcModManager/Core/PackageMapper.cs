@@ -34,6 +34,21 @@ public static class PackageMapper
             var e = raw.Replace('\\', '/').Trim();
             if (e.Length == 0 || e.EndsWith('/')) continue;              // Verzeichniseintrag
 
+            // "." steht fuer "aktuelles Verzeichnis" und traegt keine Bedeutung fuer den Zielpfad
+            // (Windows' eigenes tar.exe erzeugt es routinemaessig, s.u.). Segmente werden hier
+            // vollstaendig entfernt statt sie nur von der Traversal-Pruefung weiter unten
+            // auszunehmen: sonst ueberlebt ein Eintrag, der nur aus "." besteht, bis zur
+            // Zielpfad-Berechnung -- Segments("") liefert dort ein leeres Array und
+            // MapLoose(parts[^1]) stuerzt mit IndexOutOfRangeException ab -- und ein eingebettetes
+            // "." erzeugt einen Zielpfad-String, der sich vom aequivalenten Pfad ohne "." unterscheidet
+            // und so die Kollisionspruefung umgeht ("BepInEx/plugins/A.dll" vs.
+            // "BepInEx/./plugins/A.dll" waeren sonst zwei verschiedene Ziele, obwohl
+            // Path.GetFullPath beide auf dieselbe Datei aufloest). Split ohne RemoveEmptyEntries,
+            // damit ein fuehrender leerer Abschnitt (absoluter Pfad, UNC) fuer die Pruefung unten
+            // erhalten bleibt.
+            e = string.Join('/', e.Split('/').Where(s => s != "."));
+            if (e.Length == 0) continue;                                 // Eintrag bestand nur aus "."
+
             // ':' erlaubt sowohl Laufwerksangaben ("C:\...") als auch NTFS-Alternate-Data-Streams
             // ("datei.txt:versteckt.exe"). Beides ist ein Weg aus dem Zielordner heraus bzw. an der
             // Endungspruefung vorbei (der Stream-Name haengt hinter dem echten Dateinamen, den
@@ -126,7 +141,11 @@ public static class PackageMapper
             // IOException deckt u.a. FileNotFoundException, DirectoryNotFoundException und den ganz
             // normalen Fall ab, dass die Datei direkt nach dem Download noch vom Virenscanner gesperrt
             // ist -- das darf die WinForms-Message-Loop nicht als ungefangene Exception erreichen.
-            return new MapResult([], $"could not read the archive: {e.Message}");
+            // Absichtlich ohne e.Message: das ist vom Betriebssystem lokalisiert (auf einem deutschen
+            // Windows z.B. ein deutscher Satz) und wuerde sonst in eine rein englische
+            // Ablehnungsmeldung durchsickern. Die genaue Ursache gehoert ins Manager-Log, nicht in
+            // den Nutzertext.
+            return new MapResult([], "could not read the archive: it is missing, locked by another process, inaccessible, or not a valid zip file");
         }
     }
 
