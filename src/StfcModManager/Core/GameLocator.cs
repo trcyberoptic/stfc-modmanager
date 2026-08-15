@@ -17,7 +17,11 @@ public static partial class GameLocator
         {
             var m = GamePathLine().Match(line);
             if (!m.Success) continue;
-            var value = m.Groups["p"].Value.Replace('/', '\\').TrimEnd('\\');
+            // Das gierige \s* vor der traegen Erfassungsgruppe kann bei reinem Leerraum-Wert
+            // zurueckbacktracken und der Gruppe ein einzelnes Leerzeichen ueberlassen -> hier trimmen.
+            var raw = m.Groups["p"].Value.Trim();
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            var value = raw.Replace('/', '\\').TrimEnd('\\');
             return value.Length == 0 ? null : value;
         }
         return null;
@@ -39,6 +43,7 @@ public static partial class GameLocator
             }
         }
         catch (IOException) { /* INI unlesbar: Fallback benutzen */ }
+        catch (UnauthorizedAccessException) { /* INI unlesbar: Fallback benutzen */ }
 
         const string fallback = @"C:\Games\Star Trek Fleet Command\STFC\default\game";
         return IsValid(fallback) ? fallback : null;

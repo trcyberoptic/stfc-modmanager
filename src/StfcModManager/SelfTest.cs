@@ -38,6 +38,8 @@ internal static class SelfTest
            @"D:\y\game", "ini: picks the right line among several");
         Eq(GameLocator.ParseGamePathFromIni(new[] { @"  152033..GAME_PATH = C:/Games/g/  " }),
            @"C:\Games\g", "ini: tolerates whitespace");
+        Eq(GameLocator.ParseGamePathFromIni(new[] { "GAME_PATH=   " }),
+           null, "ini: whitespace-only value yields null");
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
