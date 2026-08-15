@@ -75,6 +75,67 @@ internal static class SelfTest
         Eq(ModInspector.DecodeStringArgs(new byte[] { 0x01, 0x00, 0xC0, 0x00, 0x00 }, 1).Count, 0,
            "blob: truncated four-byte length form is rejected");
 
+        // --- PackageMapper: Zuordnung und Ablehnung (Spec §6.3) ---
+        var r1 = PackageMapper.MapEntries(new[] { "MyMod/BepInEx/plugins/MyMod.dll", "MyMod/README.md" });
+        Eq(r1.Rejection, null, "map: nested BepInEx layout accepted");
+        Eq(r1.Files.FirstOrDefault(f => f.Entry.EndsWith(".dll"))?.Target,
+           @"BepInEx\plugins\MyMod.dll", "map: BepInEx prefix stripped");
+
+        var r2 = PackageMapper.MapEntries(new[] { "MyMod.dll" });
+        Eq(r2.Files[0].Target, @"BepInEx\plugins\MyMod.dll", "map: loose dll goes to plugins");
+
+        var r3 = PackageMapper.MapEntries(new[] { "version.dll", "community_patch_settings.toml" });
+        Eq(r3.Files[0].Target, "version.dll", "map: version.dll goes to game root");
+        Eq(r3.Files[1].Target, "community_patch_settings.toml", "map: toml goes to game root");
+
+        Check(PackageMapper.MapEntries(new[] { "../evil.dll" }).Rejection is not null,
+              "map: rejects path traversal");
+        Check(PackageMapper.MapEntries(new[] { "MyMod/../../evil.dll" }).Rejection is not null,
+              "map: rejects nested traversal");
+        Check(PackageMapper.MapEntries(new[] { @"C:\evil.dll" }).Rejection is not null,
+              "map: rejects absolute path");
+        Check(PackageMapper.MapEntries(new[] { "setup.exe" }).Rejection is not null,
+              "map: rejects executable");
+        Check(PackageMapper.MapEntries(new[] { "install.ps1" }).Rejection is not null,
+              "map: rejects script");
+
+        var r4 = PackageMapper.MapEntries(new[] { "MyMod.dll", "extra/inner.zip" });
+        Eq(r4.Files.Count, 1, "map: nested archive ignored, not rejected");
+
+        var r5 = PackageMapper.MapEntries(new[] { "MyMod/BepInEx/plugins/", "MyMod/BepInEx/plugins/A.dll" });
+        Eq(r5.Files.Count, 1, "map: directory entries skipped");
+
+        // --- PackageMapper: Haertung ueber die Spec-Beispiele hinaus (Zip-Slip-Varianten) ---
+        // Windows entfernt abschliessende Punkte/Leerzeichen beim tatsaechlichen Anlegen einer Datei;
+        // ohne Normalisierung vor der Endungspruefung wuerde "setup.exe." bzw. "setup.exe " als
+        // harmlos durchgehen, obwohl auf der Platte wieder "setup.exe" entsteht.
+        Check(PackageMapper.MapEntries(new[] { "setup.exe." }).Rejection is not null,
+              "map: rejects executable disguised with a trailing dot");
+        Check(PackageMapper.MapEntries(new[] { "setup.exe " }).Rejection is not null,
+              "map: rejects executable disguised with a trailing space");
+
+        // Ein Doppelpunkt im Dateinamen adressiert einen NTFS-Alternate-Data-Stream. Windows legt
+        // dabei den Teil vor dem Doppelpunkt als eigene (ggf. leere) Datei an — Path.GetExtension
+        // sieht nur die letzte Endung im Gesamtstring und wird so an der eigentlichen Endung vorbeigefuehrt.
+        Check(PackageMapper.MapEntries(new[] { "readme.txt:hidden.dll" }).Rejection is not null,
+              "map: rejects alternate-data-stream suffix (colon smuggles a second file)");
+        Check(PackageMapper.MapEntries(new[] { "MyMod.exe:hidden.dll" }).Rejection is not null,
+              "map: rejects blocked base name hidden behind an alternate-data-stream suffix");
+
+        // ".." ist nicht der einzige Weg nach oben: ein reines Punkte-Segment ("...", ".. " usw.)
+        // trimmt sich nach Windows-Regeln ebenfalls auf "" bzw. auf eine Eltern-Referenz zusammen.
+        Check(PackageMapper.MapEntries(new[] { "MyMod/.../evil.dll" }).Rejection is not null,
+              "map: rejects a dots-only path segment that is not literally \"..\"");
+        Check(PackageMapper.MapEntries(new[] { @"MyMod\..\..\evil.dll" }).Rejection is not null,
+              "map: rejects traversal expressed with backslash separators only");
+        Check(PackageMapper.MapEntries(new[] { @"\\server\share\evil.dll" }).Rejection is not null,
+              "map: rejects a UNC-style path");
+
+        // Path.GetExtension behandelt einen Namen, der nur aus einem fuehrenden Punkt besteht
+        // (".exe"), als vollstaendige "Erweiterung" — das deckt sich hier mit der Blockliste.
+        Check(PackageMapper.MapEntries(new[] { ".exe" }).Rejection is not null,
+              "map: rejects a dotfile-only name that is itself a blocked extension");
+
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
     }
