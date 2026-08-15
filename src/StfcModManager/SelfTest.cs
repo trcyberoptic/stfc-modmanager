@@ -209,6 +209,56 @@ internal static class SelfTest
         Eq(rEmbeddedDot.Files[0].Target, @"BepInEx\plugins\A.dll",
            "map: an embedded \"./\" segment is dropped before target computation");
 
+        // --- AppState: Rundlauf durch die Serialisierung ---
+        var st = new AppState { GamePath = @"C:\g", LastKnownClientBuild = "254" };
+        st.Mods.Add(new ModEntry
+        {
+            Id = "Optimus.STFC.Berserker", Name = "Hellebarde", Version = "1.10.12",
+            Enabled = true, SourceKind = "github", Repo = "trcyberoptic/STFC.Hellebarde",
+            ReleaseTag = "v1.10.12", AssetName = "Hellebarde.dll",
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\Hellebarde.dll", Sha256 = "aa" } }
+        });
+        var json = AppState.SerializeTo(st);
+        var back = AppState.DeserializeFrom(json);
+        Eq(back.Mods.Count, 1, "state: one mod survives the round trip");
+        Eq(back.Mods[0].Files[0].Path, @"BepInEx\plugins\Hellebarde.dll", "state: file path survives");
+        Eq(back.LastKnownClientBuild, "254", "state: client build survives");
+        Eq(AppState.DeserializeFrom("").Mods.Count, 0, "state: empty text yields empty state");
+        Eq(AppState.DeserializeFrom("{ not json").Mods.Count, 0, "state: broken json yields empty state");
+
+        // --- AppState: Haertung gegen kaputte oder handbearbeitete Zustandsdateien ---
+        // Jeder dieser Faelle darf DeserializeFrom NIE werfen lassen -- eine handbearbeitete
+        // oder anderweitig kaputte state.json darf den Programmstart nie verhindern.
+        Eq(AppState.DeserializeFrom("   \n\t  ").Mods.Count, 0, "state: whitespace-only text yields empty state");
+        Eq(AppState.DeserializeFrom("[1,2,3]").Mods.Count, 0, "state: json array (wrong shape) yields empty state");
+        Eq(AppState.DeserializeFrom("\"hello\"").Mods.Count, 0, "state: json string (wrong shape) yields empty state");
+
+        // JsonSerializer.Deserialize<T> liefert fuer den woertlichen Text "null" tatsaechlich
+        // eine CLR-null zurueck (kein Fehlschlag, keine Exception) -- genau dafuer faengt das
+        // "?? new AppState()" in DeserializeFrom auf. Verifiziert statt angenommen.
+        Eq(AppState.DeserializeFrom("null").Mods.Count, 0, "state: json null literal yields empty state");
+
+        // Unbekannte Zusatzfelder werden von System.Text.Json standardmaessig stillschweigend
+        // ignoriert; bekannte Felder daneben muessen trotzdem ankommen.
+        Eq(AppState.DeserializeFrom("""{"UnknownField":123,"Nested":{"a":1},"GamePath":"C:\\Games\\g"}""").GamePath,
+           @"C:\Games\g", "state: unknown extra properties are ignored, known fields still parse");
+
+        // "Mods": null ueberschreibt sonst den Feldinitialisierer mit null, denn System.Text.Json
+        // respektiert die Nullable-Annotation der Property beim Deserialisieren standardmaessig
+        // nicht -- ohne die Korrektur in DeserializeFrom wuerde back.Mods hier zu einer erst bei
+        // der naechsten Verwendung sichtbaren NullReferenceException fuehren.
+        Eq(AppState.DeserializeFrom("""{"Mods":null,"TrustedRepos":null}""").Mods.Count, 0,
+           "state: explicit null Mods list does not surface as null");
+        Eq(AppState.DeserializeFrom("""{"Mods":null,"TrustedRepos":null}""").TrustedRepos.Count, 0,
+           "state: explicit null TrustedRepos list does not surface as null");
+
+        // Ein fuehrendes UTF-8-BOM (z. B. weil ein Editor die Datei beim Handbearbeiten so
+        // gespeichert hat) darf den Inhalt nicht stillschweigend verwerfen: ohne den Trim in
+        // DeserializeFrom scheitert der Utf8JsonReader daran, was zwar gefangen wird, dabei aber
+        // einen echten Mod-Bestand verlieren wuerde statt ihn zu lesen.
+        var bomJson = "\uFEFF" + AppState.SerializeTo(st);
+        Eq(AppState.DeserializeFrom(bomJson).Mods.Count, 1, "state: leading UTF-8 BOM does not lose the parsed state");
+
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
     }
