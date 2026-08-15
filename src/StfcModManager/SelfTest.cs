@@ -122,8 +122,11 @@ internal static class SelfTest
         Check(PackageMapper.MapEntries(new[] { "MyMod.exe:hidden.dll" }).Rejection is not null,
               "map: rejects blocked base name hidden behind an alternate-data-stream suffix");
 
-        // ".." ist nicht der einzige Weg nach oben: ein reines Punkte-Segment ("...", ".. " usw.)
-        // trimmt sich nach Windows-Regeln ebenfalls auf "" bzw. auf eine Eltern-Referenz zusammen.
+        // Reine Punkte-/Leerzeichen-Segmente wie "...", "...." oder ".. " sind verboten -- NICHT
+        // (wie eine fruehere Version dieses Kommentars fälschlich behauptete) weil Windows sie beim
+        // tatsaechlichen Anlegen zu einer Eltern-Referenz zusammenzieht (ein Fix-Review hat das
+        // empirisch widerlegt: "BepInEx\...\x" wirft DirectoryNotFoundException statt hochzulaufen),
+        // sondern als reine Vorsichtsmassnahme gegen Formen, die kein legitimes Release traegt.
         Check(PackageMapper.MapEntries(new[] { "MyMod/.../evil.dll" }).Rejection is not null,
               "map: rejects a dots-only path segment that is not literally \"..\"");
         Check(PackageMapper.MapEntries(new[] { @"MyMod\..\..\evil.dll" }).Rejection is not null,
@@ -135,6 +138,44 @@ internal static class SelfTest
         // (".exe"), als vollstaendige "Erweiterung" — das deckt sich hier mit der Blockliste.
         Check(PackageMapper.MapEntries(new[] { ".exe" }).Rejection is not null,
               "map: rejects a dotfile-only name that is itself a blocked extension");
+
+        // Der einzelne Punkt "." bleibt dagegen ausdruecklich erlaubt: Windows' eigenes tar.exe
+        // erzeugt ihn routinemaessig ("tar -a -cf mod.zip ." liefert Eintraege wie "./MyMod.dll").
+        // Ohne diese Ausnahme wuerde ein voellig legitimes, so gebautes Release komplett abgelehnt.
+        var rDotSlash = PackageMapper.MapEntries(new[] { "./MyMod.dll" });
+        Eq(rDotSlash.Rejection, null, "map: leading \"./\" (tar.exe style) is accepted, not traversal");
+        Eq(rDotSlash.Files[0].Target, @"BepInEx\plugins\MyMod.dll",
+           "map: leading \"./\" still maps a loose dll to plugins");
+
+        // --- PackageMapper: Fix Round 1 ---
+        // Entry muss die rohe, unveraenderte Zeichenkette aus dem Archiv bleiben: ein spaeterer
+        // Aufrufer sucht damit per zip.GetEntry(m.Entry) im Original-Archiv, und ein Backslash-Eintrag
+        // wuerde dort nach einer Normalisierung ("/" statt "\") nicht mehr gefunden -- stiller
+        // Teil-Install trotz zugestimmtem Vertrauensdialog.
+        var rRawEntry = PackageMapper.MapEntries(new[] { @"MyMod\BepInEx\plugins\B.dll" });
+        Eq(rRawEntry.Rejection, null, "map: backslash-separated BepInEx layout accepted");
+        Eq(rRawEntry.Files[0].Entry, @"MyMod\BepInEx\plugins\B.dll",
+           "map: Entry keeps the raw, unmodified name so zip.GetEntry(m.Entry) still finds it");
+        Eq(rRawEntry.Files[0].Target, @"BepInEx\plugins\B.dll",
+           "map: Target is still computed from the normalized form");
+
+        // Zwei Eintraege, die auf denselben Zielpfad abbilden (hier: gleicher Dateiname unter
+        // unterschiedlichen losen Ordnern), werden abgelehnt statt einen davon stillschweigend
+        // fallenzulassen -- sonst wuerde eine im Vertrauensdialog gezeigte Datei nie installiert.
+        Check(PackageMapper.MapEntries(new[] { "Release/Mod.dll", "Debug/Mod.dll" }).Rejection is not null,
+              "map: rejects colliding targets (Release/Mod.dll vs Debug/Mod.dll both map to plugins\\Mod.dll)");
+
+        // Ein auf Windows verbotenes Zeichen im Dateinamen (hier NUL) wuerde sonst erst spaeter bei
+        // Installer.ResolveInside als ungefangene ArgumentException aus Path.GetFullPath auftauchen.
+        Check(PackageMapper.MapEntries(new[] { "a\0b.dll" }).Rejection is not null,
+              "map: rejects a file name containing a character illegal on Windows (NUL byte)");
+
+        // MapArchive darf nie werfen: direkt nach einem Download kann die Datei noch fehlen oder vom
+        // Virenscanner gesperrt sein (IOException) -- das muss als Rejection zurueckkommen, nicht als
+        // ungefangene Exception in der WinForms-Message-Loop landen.
+        var missingZip = Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-{Guid.NewGuid():N}.zip");
+        Check(PackageMapper.MapArchive(missingZip).Rejection is not null,
+              "map: MapArchive rejects rather than throws when the archive file cannot be opened");
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
