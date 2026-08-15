@@ -97,6 +97,13 @@ public sealed class AppState
             state.Mods ??= [];
             state.SharedFiles ??= [];
             state.TrustedRepos ??= [];
+
+            // Dieselbe Luecke gilt fuer einzelne Listenelemente: "Mods": [null] liefert eine
+            // Liste der Laenge 1 mit einem null-Eintrag -- jede spaetere Iteration, die ein
+            // Feld des Elements liest (z. B. mod.Id), stuerzt dann mit NullReferenceException ab.
+            state.Mods.RemoveAll(m => m is null);
+            state.SharedFiles.RemoveAll(f => f is null);
+            state.TrustedRepos.RemoveAll(r => r is null);
             return state;
         }
         catch (JsonException) { return new AppState(); }
@@ -106,11 +113,47 @@ public sealed class AppState
     {
         try
         {
-            return File.Exists(AppPaths.StateFile)
-                ? DeserializeFrom(File.ReadAllText(AppPaths.StateFile))
-                : new AppState();
+            if (!File.Exists(AppPaths.StateFile)) return new AppState();
+
+            var text = File.ReadAllText(AppPaths.StateFile);
+            var state = DeserializeFrom(text);
+
+            // DeserializeFrom liefert fuer "Datei war leer" und "Datei war kaputt" bewusst
+            // denselben leeren AppState zurueck (die reine Funktion darf den Unterschied nicht
+            // kennen muessen). Load() braucht den Unterschied aber: eine kaputte, nicht-leere
+            // Datei darf nicht klanglos verschwinden und dann vom naechsten Save() ueberschrieben
+            // werden -- der Nutzer wuerde seinen kompletten Mod-Bestand ohne jede Spur verlieren.
+            if (!string.IsNullOrWhiteSpace(text) && !ParsesAsValidJson(text))
+            {
+                AppLog.Error($"Zustandsdatei ist beschaedigt und wird beiseite gelegt: {AppPaths.StateFile}");
+                SetAsideCorruptStateFile();
+            }
+
+            return state;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return new AppState(); }
+    }
+
+    /// <summary>Nur zur Fehlererkennung in Load(): true, wenn JsonSerializer den Text ohne
+    /// Ausnahme verarbeitet (unabhaengig vom Ergebnis-Shape). DeserializeFrom selbst bleibt
+    /// unveraendert und faengt JsonException weiterhin fuer sich allein ab.</summary>
+    private static bool ParsesAsValidJson(string json)
+    {
+        try { JsonSerializer.Deserialize<AppState>(json, Options); return true; }
+        catch (JsonException) { return false; }
+    }
+
+    /// <summary>Verschiebt eine als kaputt erkannte state.json aus dem Weg, damit der naechste
+    /// Save() sie nicht ueberschreibt -- von Hand ist sie danach noch inspizierbar. Best-effort:
+    /// schlaegt das Verschieben selbst fehl, darf das den Start trotzdem nicht verhindern.</summary>
+    private static void SetAsideCorruptStateFile()
+    {
+        try
+        {
+            var target = $"{AppPaths.StateFile}.corrupt-{DateTime.Now:yyyyMMddHHmmss}";
+            File.Move(AppPaths.StateFile, target, overwrite: true);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 
     /// <summary>Atomar: erst in eine Nebendatei, dann verschieben. Ein Absturz mittendrin
@@ -121,7 +164,13 @@ public sealed class AppState
     public void Save()
     {
         Directory.CreateDirectory(AppPaths.Root);
-        var tmp = AppPaths.StateFile + ".tmp";
+
+        // Der Dateiname muss pro Prozess UND pro Aufruf eindeutig sein: nichts in der Anwendung
+        // verhindert eine zweite laufende Instanz, und ein fester ".tmp"-Name liesse Prozess B
+        // die noch ausstehende Nebendatei von Prozess A ueberschreiben. Prozess A wuerde danach
+        // klanglos den Inhalt von B verschieben (kein Fehler, kein Log-Eintrag) -- oder umgekehrt
+        // mit FileNotFoundException scheitern, weil der geteilte Name schon wegverschoben wurde.
+        var tmp = $"{AppPaths.StateFile}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
         File.WriteAllText(tmp, SerializeTo(this));
         File.Move(tmp, AppPaths.StateFile, overwrite: true);
     }

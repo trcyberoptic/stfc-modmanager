@@ -259,6 +259,17 @@ internal static class SelfTest
         var bomJson = "\uFEFF" + AppState.SerializeTo(st);
         Eq(AppState.DeserializeFrom(bomJson).Mods.Count, 1, "state: leading UTF-8 BOM does not lose the parsed state");
 
+        // --- AppState: Fix Round 1 (F2) -- null-Elemente innerhalb der Listen, nicht nur die Listen selbst ---
+        // Eine null-Liste wurde bereits abgefangen; ein einzelnes null-Element darin (z. B. durch
+        // ein verirrtes ",null" in einer handbearbeiteten Datei) ist dieselbe Fehlerklasse und muss
+        // ebenso rausgefiltert werden, sonst crasht die naechste Iteration ueber die Liste.
+        Eq(AppState.DeserializeFrom("""{"Mods":[null]}""").Mods.Count, 0,
+           "state: a null element inside Mods is dropped, not kept as null");
+        Eq(AppState.DeserializeFrom("""{"SharedFiles":[null]}""").SharedFiles.Count, 0,
+           "state: a null element inside SharedFiles is dropped, not kept as null");
+        Eq(AppState.DeserializeFrom("""{"TrustedRepos":[null]}""").TrustedRepos.Count, 0,
+           "state: a null element inside TrustedRepos is dropped, not kept as null");
+
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
     }
