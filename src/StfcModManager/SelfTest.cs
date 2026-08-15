@@ -41,6 +41,24 @@ internal static class SelfTest
         Eq(GameLocator.ParseGamePathFromIni(new[] { "GAME_PATH=   " }),
            null, "ini: whitespace-only value yields null");
 
+        // --- ModInspector: Attribut-Blob-Decoder ---
+        // 01 00 | 03 "abc" | 02 "hi" | 05 "1.2.3"
+        var blob = new byte[] { 0x01, 0x00,
+                                0x03, (byte)'a', (byte)'b', (byte)'c',
+                                0x02, (byte)'h', (byte)'i',
+                                0x05, (byte)'1', (byte)'.', (byte)'2', (byte)'.', (byte)'3' };
+        var args = ModInspector.DecodeStringArgs(blob, 3);
+        Eq(args.Count, 3, "blob: three args");
+        Eq(args.Count > 0 ? args[0] : null, "abc", "blob: first arg");
+        Eq(args.Count > 2 ? args[2] : null, "1.2.3", "blob: third arg");
+
+        Eq(ModInspector.DecodeStringArgs(new byte[] { 0x01, 0x00, 0xFF }, 1).Count, 0,
+           "blob: null string stops decoding");
+        Eq(ModInspector.DecodeStringArgs(new byte[] { 0x02, 0x00, 0x01, (byte)'x' }, 1).Count, 0,
+           "blob: wrong prolog yields nothing");
+        Eq(ModInspector.DecodeStringArgs(new byte[] { 0x01, 0x00, 0x00 }, 1)[0], "",
+           "blob: empty string is valid");
+
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
     }
