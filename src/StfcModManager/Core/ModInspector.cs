@@ -56,7 +56,8 @@ public static class ModInspector
                 : new PluginInfo(guid, string.IsNullOrEmpty(name) ? guid : name,
                                  version ?? "0.0.0", deps, incompat);
         }
-        catch (Exception e) when (e is IOException or BadImageFormatException or UnauthorizedAccessException)
+        catch (Exception e) when (e is IOException or BadImageFormatException or UnauthorizedAccessException
+                                    or ArgumentException or NotSupportedException)
         {
             return null;
         }

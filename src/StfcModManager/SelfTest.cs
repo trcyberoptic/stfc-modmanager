@@ -50,6 +50,7 @@ internal static class SelfTest
         var args = ModInspector.DecodeStringArgs(blob, 3);
         Eq(args.Count, 3, "blob: three args");
         Eq(args.Count > 0 ? args[0] : null, "abc", "blob: first arg");
+        Eq(args.Count > 1 ? args[1] : null, "hi", "blob: second arg");
         Eq(args.Count > 2 ? args[2] : null, "1.2.3", "blob: third arg");
 
         Eq(ModInspector.DecodeStringArgs(new byte[] { 0x01, 0x00, 0xFF }, 1).Count, 0,
@@ -58,6 +59,21 @@ internal static class SelfTest
            "blob: wrong prolog yields nothing");
         Eq(ModInspector.DecodeStringArgs(new byte[] { 0x01, 0x00, 0x00 }, 1)[0], "",
            "blob: empty string is valid");
+
+        // 2-Byte-Laengenform: 200 = 0x80,0xC8 (ECMA-335 II.23.2)
+        var longBlob = new byte[] { 0x01, 0x00, 0x80, 0xC8 }
+            .Concat(Enumerable.Repeat((byte)'a', 200)).ToArray();
+        var longArgs = ModInspector.DecodeStringArgs(longBlob, 1);
+        Eq(longArgs.Count, 1, "blob: two-byte length form decodes");
+        Eq(longArgs.Count > 0 ? longArgs[0].Length : -1, 200, "blob: two-byte length yields 200 chars");
+
+        // Deklarierte Laenge groesser als der Puffer -> kein Ergebnis, kein Absturz
+        Eq(ModInspector.DecodeStringArgs(new byte[] { 0x01, 0x00, 0x05, (byte)'a', (byte)'b' }, 1).Count, 0,
+           "blob: declared length overrunning the buffer is rejected");
+
+        // 4-Byte-Form, aber nur 3 Bytes vorhanden -> kein Ergebnis, kein Absturz
+        Eq(ModInspector.DecodeStringArgs(new byte[] { 0x01, 0x00, 0xC0, 0x00, 0x00 }, 1).Count, 0,
+           "blob: truncated four-byte length form is rejected");
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
