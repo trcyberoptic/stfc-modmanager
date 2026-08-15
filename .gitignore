@@ -1,0 +1,9 @@
+# Build output
+bin/
+obj/
+
+# Local mod drop folder (user content, not source)
+LocalMods/
+
+# Session tooling
+.remember/
