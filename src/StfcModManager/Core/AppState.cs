@@ -113,6 +113,13 @@ public sealed class AppState
     {
         try
         {
+            // Ein harter Absturz oder Stromausfall zwischen File.WriteAllText und File.Move in
+            // Save() (also VOR dem Delete-im-Catch, s. dort) kann eine eindeutig benannte
+            // Nebendatei hinterlassen, die niemand mehr referenziert -- die F1-Namenseindeutigkeit
+            // bedeutet, dass kein spaeterer Save()-Aufruf sie je wiederverwendet. Deshalb hier
+            // gefegt, unabhaengig davon, ob ueberhaupt eine state.json existiert.
+            SweepLeftoverTempFiles();
+
             if (!File.Exists(AppPaths.StateFile)) return new AppState();
 
             var text = File.ReadAllText(AppPaths.StateFile);
@@ -156,11 +163,30 @@ public sealed class AppState
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 
+    /// <summary>Raeumt Nebendateien auf, die ein fruehere Save()-Aufruf hinterlassen hat, ohne sie
+    /// selbst wieder loeschen zu koennen (harter Absturz, Stromausfall). Die eindeutigen Namen aus
+    /// dem F1-Fix bedeuten: KEIN spaeterer Save() referenziert eine bestehende Nebendatei je wieder,
+    /// sie waeren sonst fuer immer liegen geblieben. Best-effort und komplett selbst-gefangen --
+    /// ein Fehler beim Fegen darf weder den Rest von Load() noch den Programmstart verhindern.</summary>
+    private static void SweepLeftoverTempFiles()
+    {
+        try
+        {
+            foreach (var f in Directory.EnumerateFiles(AppPaths.Root, "state.json.*.tmp"))
+            {
+                try { File.Delete(f); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
+
     /// <summary>Atomar: erst in eine Nebendatei, dann verschieben. Ein Absturz mittendrin
     /// laesst die alte Datei intakt statt eine halbe zu hinterlassen.
-    /// Absichtlich ohne Catch: schlaegt das Schreiben fehl (Datentraeger voll, Datei durch
-    /// einen Editor gesperrt, schreibgeschuetztes Profil), muss der Aufrufer das erfahren --
-    /// sonst glaubt der Manager, ein Mod sei registriert, obwohl der Zustand nie persistiert wurde.</summary>
+    /// Absichtlich ohne Catch, die den Fehlschlag verschluckt: schlaegt das Schreiben fehl
+    /// (Datentraeger voll, Datei durch einen Editor gesperrt, schreibgeschuetztes Profil), muss
+    /// der Aufrufer das erfahren -- sonst glaubt der Manager, ein Mod sei registriert, obwohl der
+    /// Zustand nie persistiert wurde. Der einzige Catch hier raeumt nur die eigene Nebendatei auf
+    /// und wirft danach unveraendert weiter (siehe Kommentar dort).</summary>
     public void Save()
     {
         Directory.CreateDirectory(AppPaths.Root);
@@ -171,7 +197,21 @@ public sealed class AppState
         // klanglos den Inhalt von B verschieben (kein Fehler, kein Log-Eintrag) -- oder umgekehrt
         // mit FileNotFoundException scheitern, weil der geteilte Name schon wegverschoben wurde.
         var tmp = $"{AppPaths.StateFile}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
-        File.WriteAllText(tmp, SerializeTo(this));
-        File.Move(tmp, AppPaths.StateFile, overwrite: true);
+        try
+        {
+            File.WriteAllText(tmp, SerializeTo(this));
+            File.Move(tmp, AppPaths.StateFile, overwrite: true);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            // Die eindeutigen Namen aus dem F1-Fix haben eine Kehrseite: kein spaeterer Save()
+            // ueberschreibt/referenziert diese Nebendatei je wieder, ein fehlgeschlagener Schreib-
+            // oder Umbenennungsvorgang wuerde also fuer immer eine Leiche in %LOCALAPPDATA%
+            // hinterlassen. Das Aufraeumen hier ist best-effort (eigener gefilterter Catch) und
+            // darf die urspruengliche Exception nie verschlucken -- deshalb das abschliessende
+            // "throw;" statt eines neuen Wurfs oder eines stillen Rueckgabewerts.
+            try { File.Delete(tmp); } catch (Exception ce) when (ce is IOException or UnauthorizedAccessException) { }
+            throw;
+        }
     }
 }
