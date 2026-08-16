@@ -20,6 +20,12 @@ public static class AppPaths
 
 public sealed class InstalledFile
 {
+    /// <summary>Kanonischer, aktivierter Ort relativ zum Spielordner (z. B.
+    /// "BepInEx\plugins\X.dll"). Wird von Installer.SetEnabled NIE umgeschrieben, wenn eine
+    /// Datei zwischen plugins und plugins-disabled wandert -- Installer.PhysicalPath leitet den
+    /// tatsaechlichen Ort aus diesem stabilen Schluessel plus ModEntry.Enabled ab. Ohne diese
+    /// Stabilitaet laufen Buchfuehrung (state.SharedFiles, per Pfad referenziert) und Wirklichkeit
+    /// auseinander, sobald ein Mod deaktiviert wird (Pre-Flight-Review Fix Round 1, C1).</summary>
     public string Path { get; set; } = "";
     public string Sha256 { get; set; } = "";
 }

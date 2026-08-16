@@ -335,6 +335,111 @@ internal static class SelfTest
         Eq(nativeMod.Enabled, true,
            "SetEnabled: native toggle with neither version.dll nor version.dll_ present does not throw and still flips Enabled");
 
+        // --- Installer: Fix Round 1, C1 -- stabiler Pfad-Schluessel, Remove() loescht keine
+        // fremd benoetigte geteilte Datei mehr (Pre-Flight-Review Reproduktion) ---
+        // Reproduziert die Kernaussage von C1 rein ueber die Buchfuehrung: Json.dll steht sowohl
+        // in modA.Files (unter dem KANONISCHEN Pfad -- SetEnabled schreibt ihn seit diesem Fix
+        // nie mehr um) als auch in state.SharedFiles mit modB als weiterem Anbieter. Ohne den
+        // stabilen Schluessel haette Remove(modA) mit einem umgeschriebenen Pfad keinen Treffer in
+        // state.SharedFiles gefunden, ReleaseShared haette "unbekannt, darf weg" gemeldet, und die
+        // Datei waere geloescht worden, obwohl modB sie noch braucht.
+        var c1Game = new GameInstall(Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-nonexistent-{Guid.NewGuid():N}"));
+        var c1State = new AppState();
+        var c1ModA = new ModEntry
+        {
+            Id = "modA", Name = "A", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\Json.dll", Sha256 = "j" } }
+        };
+        c1State.Mods.Add(c1ModA);
+        Installer.RegisterShared(c1State, @"BepInEx\plugins\Json.dll", "j", "13.0.3", "modA");
+        Installer.RegisterShared(c1State, @"BepInEx\plugins\Json.dll", "j", "13.0.3", "modB");
+
+        Installer.Remove(c1State, c1Game, c1ModA);
+        Eq(c1State.SharedFiles.Count, 1, "C1: Json.dll (still needed by modB) survives Remove(modA)");
+        Eq(c1State.SharedFiles.Count == 1 ? c1State.SharedFiles[0].Providers.Count : -1, 1,
+           "C1: only modA's provider entry was released");
+        Eq(c1State.SharedFiles.Count == 1 ? c1State.SharedFiles[0].Providers[0] : null, "modB",
+           "C1: modB remains the sole provider");
+
+        // --- Installer: Fix Round 1, I4 -- Mod-Id-Saeuberung fuer Dateinamen ---
+        // ModInspector liest die Id ungeprueft aus einer Fremd-DLL; SanitizeForFileName muss
+        // Pfadtrenner und ".."-Aufstiege entschaerfen, bevor die Id Teil eines Dateinamens wird
+        // (BackupConfig), sonst macht z. B. eine Id wie "..\..\evil" aus dem Konfigurations-
+        // Dateinamen einen Pfad, der aus dem vorgesehenen Ordner hinauszeigt.
+        var sanitizedTraversal = Installer.SanitizeForFileName(@"..\..\evil");
+        Check(!sanitizedTraversal.Contains(".."), "sanitize: a mod id with \"..\\\" traversal no longer contains \"..\" after sanitizing");
+        Check(!sanitizedTraversal.Contains('\\'), "sanitize: a mod id with \"..\\\" traversal no longer contains a backslash after sanitizing");
+
+        var sanitizedSeparator = Installer.SanitizeForFileName("Some/Mod.Id");
+        Check(!sanitizedSeparator.Contains('/'), "sanitize: a mod id containing a separator no longer contains '/' after sanitizing");
+        Eq(sanitizedSeparator, "Some_Mod.Id", "sanitize: a forward slash is replaced with '_', everything else is left alone");
+
+        // --- Installer.PhysicalPath: der aus dem stabilen Schluessel ABGELEITETE Ort (C1) ---
+        // Reine Zeichenkettenarbeit, kein I/O: der Spielordner existiert bewusst nicht.
+        var ppRoot = Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-nonexistent-{Guid.NewGuid():N}");
+        var ppGame = new GameInstall(ppRoot);
+        var ppDll = new InstalledFile { Path = @"BepInEx\plugins\MyMod\Core.dll", Sha256 = "c" };
+        var ppCfg = new InstalledFile { Path = @"BepInEx\config\MyMod.cfg", Sha256 = "g" };
+        var ppMod = new ModEntry
+        {
+            Id = "nested", Name = "Nested", Version = "1.0", Enabled = true,
+            Files = { ppDll, ppCfg }
+        };
+
+        Eq(Installer.PhysicalPath(ppGame, ppMod, ppDll), Path.Combine(ppRoot, @"BepInEx\plugins\MyMod\Core.dll"),
+           "PhysicalPath: an enabled mod's file sits at its canonical (stored) location, subfolder included");
+
+        ppMod.Enabled = false;
+        Eq(Installer.PhysicalPath(ppGame, ppMod, ppDll), Path.Combine(ppRoot, @"BepInEx\plugins-disabled\Core.dll"),
+           "PhysicalPath: a disabled mod's dll is derived to plugins-disabled");
+        Eq(ppDll.Path, @"BepInEx\plugins\MyMod\Core.dll",
+           "PhysicalPath: deriving a location never rewrites the stored canonical path");
+        Eq(Installer.PhysicalPath(ppGame, ppMod, ppCfg), Path.Combine(ppRoot, @"BepInEx\config\MyMod.cfg"),
+           "PhysicalPath: only .dll files move to plugins-disabled, a config keeps its place");
+
+        // Bei einem nativen Mod wandert AUSSCHLIESSLICH version.dll; mitgelieferte Beilagen
+        // (doorstop_config.ini, .toml) bleiben liegen, wo sie sind -- wuerden auch sie auf
+        // version.dll abgebildet, loeschte Remove() sie nie.
+        var ppNativeDll = new InstalledFile { Path = "version.dll", Sha256 = "v" };
+        var ppNativeIni = new InstalledFile { Path = "doorstop_config.ini", Sha256 = "d" };
+        var ppNative = new ModEntry
+        {
+            Id = "CommunityPatch", Name = "Community Patch", Version = "1.0",
+            SourceKind = "native", Enabled = false, Files = { ppNativeDll, ppNativeIni }
+        };
+        Eq(Installer.PhysicalPath(ppGame, ppNative, ppNativeDll), Path.Combine(ppRoot, "version.dll_"),
+           "PhysicalPath: a disabled native mod's version.dll is derived to version.dll_");
+        Eq(Installer.PhysicalPath(ppGame, ppNative, ppNativeIni), Path.Combine(ppRoot, "doorstop_config.ini"),
+           "PhysicalPath: a native mod's other files keep their own location instead of collapsing onto version.dll");
+
+        // --- Installer.Apply: Vorbedingungen schlagen zu, bevor irgendetwas angefasst wird (I1/M4, I2) ---
+        static string? ApplyErrorName(string root, IReadOnlyList<(string Source, string Target)> ops)
+        {
+            try { Installer.Apply(root, ops); return null; }
+            catch (Exception e) { return e.GetType().Name; }
+        }
+
+        var apRoot = Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-nonexistent-{Guid.NewGuid():N}");
+        Eq(ApplyErrorName(apRoot, new (string, string)[] { ("a.dll", @"BepInEx\plugins\") }), "ArgumentException",
+           "Apply: a target ending in a directory separator is rejected -- it is never a file");
+        // Der Doppelte-Ziele-Test vergleicht die AUFGELOESTE Form: dieselbe Datei, nur einmal mit
+        // '\' und einmal mit '/' geschrieben, ist trotzdem ein Duplikat.
+        Eq(ApplyErrorName(apRoot, new (string, string)[]
+           { ("a.dll", @"BepInEx\plugins\Dup.dll"), ("b.dll", "BepInEx/plugins/Dup.dll") }), "ArgumentException",
+           "Apply: two targets differing only in separator style are still one duplicated target");
+        Check(!Directory.Exists(apRoot), "Apply: a rejected op list touches nothing on disk");
+
+        // --- Installer.SetEnabled: ein Umschalten auf den bereits bestehenden Zustand tut nichts ---
+        var seRoot = Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-nonexistent-{Guid.NewGuid():N}");
+        var seMod = new ModEntry
+        {
+            Id = "already-on", Name = "On", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\On.dll", Sha256 = "o" } }
+        };
+        Installer.SetEnabled(new GameInstall(seRoot), seMod, true);
+        Eq(seMod.Enabled, true, "SetEnabled: toggling to the state a mod is already in leaves it enabled");
+        Check(!Directory.Exists(seRoot), "SetEnabled: a no-op toggle creates no directories in the game folder");
+
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
     }
