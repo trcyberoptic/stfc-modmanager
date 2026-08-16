@@ -331,7 +331,7 @@ internal static class SelfTest
             Id = "CommunityPatch", Name = "Community Patch", Version = "1.0",
             SourceKind = "native", Enabled = false
         };
-        Installer.SetEnabled(nativeGame, nativeMod, true);
+        Installer.SetEnabled(new AppState(), nativeGame, nativeMod, true);
         Eq(nativeMod.Enabled, true,
            "SetEnabled: native toggle with neither version.dll nor version.dll_ present does not throw and still flips Enabled");
 
@@ -390,8 +390,11 @@ internal static class SelfTest
            "PhysicalPath: an enabled mod's file sits at its canonical (stored) location, subfolder included");
 
         ppMod.Enabled = false;
-        Eq(Installer.PhysicalPath(ppGame, ppMod, ppDll), Path.Combine(ppRoot, @"BepInEx\plugins-disabled\Core.dll"),
-           "PhysicalPath: a disabled mod's dll is derived to plugins-disabled");
+        // Die Unterordnerstruktur wird gespiegelt, nicht abgeflacht: sonst faenden zwei Mods mit
+        // gleichnamigen DLLs in verschiedenen Unterordnern in plugins-disabled dieselbe Datei vor
+        // und ueberschrieben sich gegenseitig (Fix Round 2, I5).
+        Eq(Installer.PhysicalPath(ppGame, ppMod, ppDll), Path.Combine(ppRoot, @"BepInEx\plugins-disabled\MyMod\Core.dll"),
+           "PhysicalPath: a disabled mod's dll is derived to the MIRRORED path under plugins-disabled");
         Eq(ppDll.Path, @"BepInEx\plugins\MyMod\Core.dll",
            "PhysicalPath: deriving a location never rewrites the stored canonical path");
         Eq(Installer.PhysicalPath(ppGame, ppMod, ppCfg), Path.Combine(ppRoot, @"BepInEx\config\MyMod.cfg"),
@@ -436,9 +439,74 @@ internal static class SelfTest
             Id = "already-on", Name = "On", Version = "1.0", Enabled = true,
             Files = { new InstalledFile { Path = @"BepInEx\plugins\On.dll", Sha256 = "o" } }
         };
-        Installer.SetEnabled(new GameInstall(seRoot), seMod, true);
+        Installer.SetEnabled(new AppState(), new GameInstall(seRoot), seMod, true);
         Eq(seMod.Enabled, true, "SetEnabled: toggling to the state a mod is already in leaves it enabled");
         Check(!Directory.Exists(seRoot), "SetEnabled: a no-op toggle creates no directories in the game folder");
+
+        // --- Installer, Fix Round 2: Dateien ausserhalb von BepInEx\plugins wandern nie ---
+        // Ein Mod, der winhttp.dll mitbringt, haette die beim Deaktivieren sonst nach
+        // plugins-disabled verschoben und damit den Doorstop-Loader -- und mit ihm SAEMTLICHE
+        // Mods -- stillschweigend abgeschaltet.
+        var whFile = new InstalledFile { Path = "winhttp.dll", Sha256 = "w" };
+        var whMod = new ModEntry
+        {
+            Id = "loader-carrier", Name = "Carrier", Version = "1.0", Enabled = false,
+            Files = { whFile }
+        };
+        Eq(Installer.PhysicalPath(ppGame, whMod, whFile), Path.Combine(ppRoot, "winhttp.dll"),
+           "PhysicalPath: a game-root dll of a disabled mod stays put, it is never moved to plugins-disabled");
+
+        // --- Installer, Fix Round 2: BepInEx\config\*.cfg ist geschuetzt ---
+        // Ein Archiv darf seine eigene Default-Config mitliefern; landet die in mod.Files, darf
+        // Remove() sie trotzdem nur verschieben, nie loeschen (Spec §6.6).
+        var cfgGame = new GameInstall(Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-nonexistent-{Guid.NewGuid():N}"));
+        var cfgState = new AppState();
+        var cfgMod = new ModEntry
+        {
+            Id = "cfgmod", Name = "Cfg", Version = "1.0",
+            Files =
+            {
+                new InstalledFile { Path = @"BepInEx\plugins\Cfg.dll", Sha256 = "d" },
+                new InstalledFile { Path = @"BepInEx\config\cfgmod.cfg", Sha256 = "c" }
+            }
+        };
+        cfgState.Mods.Add(cfgMod);
+        Installer.Remove(cfgState, cfgGame, cfgMod);
+        Eq(cfgState.Mods.Count, 0, "remove: a mod carrying its own config still uninstalls completely");
+
+        // --- Installer, Fix Round 2, Minor 4: ein unaufloesbarer Eintrag blockiert Remove() nie ---
+        // Ein leerer Path (handbearbeitete state.json) loest nicht innerhalb des Spielordners auf.
+        // Frueher warf das bei jedem Versuch an derselben Stelle -- der Mod liess sich nie
+        // deinstallieren, waehrend seine frueheren Dateien laengst geloescht waren.
+        var badState = new AppState();
+        var badMod = new ModEntry
+        {
+            Id = "badpath", Name = "Bad", Version = "1.0",
+            Files = { new InstalledFile { Path = "", Sha256 = "x" } }
+        };
+        badState.Mods.Add(badMod);
+        Installer.Remove(badState, cfgGame, badMod);
+        Eq(badState.Mods.Count, 0, "remove: an entry that cannot be resolved is logged and skipped, the mod still uninstalls");
+
+        // --- Installer, Fix Round 2, I1: eine geteilte Bibliothek wird nicht weggeschoben,
+        // solange ein anderer AKTIVIERTER Mod sie anbietet ---
+        var lockRoot = Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-nonexistent-{Guid.NewGuid():N}");
+        var lockState = new AppState();
+        var lockModA = new ModEntry
+        {
+            Id = "shA", Name = "A", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\Json.dll", Sha256 = "j" } }
+        };
+        var lockModB = new ModEntry { Id = "shB", Name = "B", Version = "1.0", Enabled = true };
+        lockState.Mods.Add(lockModA);
+        lockState.Mods.Add(lockModB);
+        Installer.RegisterShared(lockState, @"BepInEx\plugins\Json.dll", "j", "13.0.3", "shA");
+        Installer.RegisterShared(lockState, @"BepInEx\plugins\Json.dll", "j", "13.0.3", "shB");
+
+        Installer.SetEnabled(lockState, new GameInstall(lockRoot), lockModA, false);
+        Eq(lockModA.Enabled, false, "SetEnabled: the mod itself still flips to disabled");
+        Check(!Directory.Exists(Path.Combine(lockRoot, @"BepInEx\plugins-disabled")),
+              "SetEnabled: a library another enabled mod still provides is not moved out from under it");
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;

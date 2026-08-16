@@ -33,8 +33,19 @@ public static class Installer
         return full;
     }
 
-    private static string ResolveInside(string gameRoot, string relativeTarget)
-        => ResolveUnder(gameRoot, relativeTarget, "target escapes the game folder");
+    /// <summary>DIE Enthaltenseins-Pruefung fuer alles, was im Spielordner angefasst wird: erst
+    /// textuell (ResolveUnder), dann physisch (RejectReparsedEscape). Bewusst EIN Helfer fuer
+    /// Apply, Remove, SetEnabled und PhysicalPath -- vorher hatte nur Apply die physische Haelfte,
+    /// und Remove/SetEnabled erfuellten die Zusage "kein Zugriff ausserhalb des Spielordners" damit
+    /// nur textuell: ueber eine Junction in "BepInEx\plugins" hat Remove nachweislich eine Datei
+    /// AUSSERHALB geloescht und SetEnabled eine von aussen hereingeholt (Fix Round 2, I3). Drei
+    /// Aufrufstellen, eine Implementierung, keine Drift.</summary>
+    private static string ResolveInside(string gameRoot, string relativePath)
+    {
+        var full = ResolveUnder(gameRoot, relativePath, "path escapes the game folder");
+        RejectReparsedEscape(Path.GetDirectoryName(full)!, gameRoot, "path escapes the game folder");
+        return full;
+    }
 
     /// <summary>Normalisiert eine Wurzel fuer den Enthaltenseins-Vergleich zu einem Praefix, der
     /// garantiert mit genau einem Trennzeichen endet. Ein Trailing-Separator in der Wurzel (ein
@@ -74,27 +85,89 @@ public static class Installer
     /// Spielordners: Path.GetFullPath ist rein textuell und sieht nicht, dass z. B.
     /// "BepInEx\plugins" per "mklink /J" (keine Elevation noetig) auf ein Verzeichnis AUSSERHALB
     /// des Spielordners zeigt -- ein textuell harmloses Ziel landet dann physisch trotzdem
-    /// draussen (Pre-Flight-Review Fix Round 1, I5). Nichts in dieser App legt selbst
-    /// Reparse-Points an, deshalb bewusst billig gehalten: nur das unmittelbare Zielverzeichnis
-    /// wird aufgeloest, nicht jedes Zwischenelement auf dem Weg dorthin.</summary>
+    /// draussen (Pre-Flight-Review Fix Round 1, I5).
+    ///
+    /// Geprueft wird JEDE Ebene vom Zielverzeichnis aufwaerts bis zur Spielordner-Wurzel, nicht
+    /// nur das unmittelbare Elternverzeichnis: liegt die Junction weiter oben (etwa auf
+    /// "BepInEx"), dann ist "BepInEx\plugins" ein ganz normales, echtes Verzeichnis INNERHALB des
+    /// Junction-Ziels, Directory.ResolveLinkTarget liefert dafuer null, und ein Ziel wie
+    /// "BepInEx\plugins\Evil.dll" wurde nachweislich ausserhalb des Spielordners geschrieben,
+    /// waehrend das flachere "BepInEx\x.dll" korrekt abgelehnt wurde (Fix Round 2, I2).
+    ///
+    /// Der TIEFSTE Reparse-Point auf dem Weg entscheidet: ResolveLinkTarget(returnFinalTarget:
+    /// true) liefert bereits ein absolutes Ziel, in dem alle darueber liegenden Verknuepfungen
+    /// aufgeloest sind -- an dieses Ziel muss nur noch der Rest des Pfades unterhalb der
+    /// gefundenen Ebene angehaengt werden.</summary>
     private static void RejectReparsedEscape(string dir, string gameRoot, string errorContext)
     {
-        var resolved = ResolveLinkOrNull(dir);
-        if (resolved is null) return; // kein Reparse-Point -- nichts zu tun
+        var rootFull = Path.GetFullPath(gameRoot);
+        var probe = Path.GetFullPath(dir);
+        var remainder = "";
 
-        var resolvedFull = Path.GetFullPath(resolved);
+        while (true)
+        {
+            var link = ResolveLinkOrNull(probe);
+            if (link is not null)
+            {
+                var landing = Path.GetFullPath(remainder.Length == 0 ? link : Path.Combine(link, remainder));
 
-        // Zwei zulaessige Wurzeln, und die zweite ist keine Kuer: ist der SPIELORDNER SELBST ein
-        // Reparse-Point (ein per mklink auf eine andere Platte ausgelagerter Spielordner ist eine
-        // voellig normale Nutzerkonfiguration), loest schon das Zielverzeichnis eines Ziels im
-        // Wurzelverzeichnis ("version.dll" -> dir == gameRoot) auf einen Pfad auf, der textuell
-        // ausserhalb liegt. Ohne den Vergleich gegen die aufgeloeste Wurzel wuerde diese Pruefung
-        // dann JEDE Installation in einen solchen Spielordner ablehnen -- fail closed heisst,
-        // echte Ausbrueche zu stoppen, nicht legitime Einrichtungen.
-        var resolvedRoot = ResolveLinkOrNull(gameRoot) ?? Path.GetFullPath(gameRoot);
-        if (IsRootOrUnder(resolvedFull, gameRoot) || IsRootOrUnder(resolvedFull, resolvedRoot)) return;
+                // Zwei zulaessige Wurzeln, und die zweite ist keine Kuer: ist der SPIELORDNER
+                // SELBST ein Reparse-Point (ein per mklink auf eine andere Platte ausgelagerter
+                // Spielordner ist eine voellig normale Nutzerkonfiguration), loest jeder Pfad
+                // darin auf eine Stelle auf, die textuell ausserhalb liegt. Ohne den Vergleich
+                // gegen die aufgeloeste Wurzel wuerde diese Pruefung dann JEDE Installation in
+                // einen solchen Spielordner ablehnen -- fail closed heisst, echte Ausbrueche zu
+                // stoppen, nicht legitime Einrichtungen.
+                var resolvedRoot = ResolveLinkOrNull(rootFull) ?? rootFull;
+                if (IsRootOrUnder(landing, rootFull) || IsRootOrUnder(landing, resolvedRoot)) return;
 
-        throw new InvalidOperationException($"{errorContext} via a reparse point pointing to '{resolvedFull}'");
+                throw new InvalidOperationException($"{errorContext} via a reparse point pointing to '{landing}'");
+            }
+
+            // Wurzel erreicht, ohne unterwegs auf eine Verknuepfung zu stossen: der rein
+            // textuelle Befund gilt.
+            if (IsSamePath(probe, rootFull)) return;
+
+            var parent = Path.GetDirectoryName(probe);
+            if (parent is null) return; // Laufwerkswurzel ueberschritten (kann bei validen Zielen nicht passieren)
+
+            remainder = remainder.Length == 0
+                ? Path.GetFileName(probe)
+                : Path.Combine(Path.GetFileName(probe), remainder);
+            probe = parent;
+        }
+    }
+
+    private static bool IsSamePath(string a, string b)
+        => Path.TrimEndingDirectorySeparator(a).Equals(
+               Path.TrimEndingDirectorySeparator(b), StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Eine Konfigurationsdatei unterhalb von BepInEx\config. Die wird NIE geloescht, nur
+    /// gesichert (Spec §6.6) -- und zwar unabhaengig davon, wie sie in mod.Files geraten ist.
+    /// Genau das war die Luecke: ein Archiv mit "MyMod/BepInEx/config/MyMod.cfg" bildet (durch
+    /// PackageMapper.MapEntries nachgemessen) auf ein regulaeres Ziel ab, landete damit in
+    /// mod.Files -- und Remove() hat die vom Nutzer eingestellte Config schlicht geloescht, bevor
+    /// BackupConfig sie sichern konnte (Fix Round 2, kritisch).</summary>
+    private static bool IsProtectedConfig(string relPath)
+    {
+        var normalized = relPath.Replace('/', '\\');
+        return normalized.EndsWith(".cfg", StringComparison.OrdinalIgnoreCase)
+               && normalized.StartsWith(@"BepInEx\config\", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Der Teil eines gespeicherten Pfades unterhalb von "BepInEx\plugins\", oder null,
+    /// wenn die Datei gar nicht dort liegt. Nur Dateien unterhalb von plugins duerfen beim
+    /// Umschalten wandern: ein Mod, der (auch) winhttp.dll oder doorstop_config.ini im
+    /// Spielordner mitbringt, haette sonst beim Deaktivieren den ganzen Doorstop-Loader nach
+    /// plugins-disabled verschoben und damit still SAEMTLICHE Mods abgeschaltet (Fix Round 2,
+    /// Minor 5).</summary>
+    private static string? PluginsRelative(string relPath)
+    {
+        const string prefix = @"BepInEx\plugins\";
+        var normalized = relPath.Replace('/', '\\');
+        return normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            ? normalized[prefix.Length..]
+            : null;
     }
 
     /// <summary>Legt das Zielverzeichnis an und merkt sich, welche Ebenen dabei neu entstanden
@@ -139,6 +212,14 @@ public static class Installer
 
             var full = ResolveInside(gameRoot, target);
 
+            // Ein Ziel, unter dessen Namen bereits ein VERZEICHNIS liegt, kann nie eine Datei
+            // werden: File.Exists() liefert false (es ist ja kein File), der Eintrag landete
+            // faelschlich in "written", der Kopiervorgang scheiterte, und das Rollback versuchte
+            // per File.Delete() ein Verzeichnis zu loeschen -- das schlaegt ebenfalls fehl und
+            // meldete Schaden an einem Ordner, den nie jemand angefasst hat (Fix Round 2, Minor 1).
+            if (Directory.Exists(full))
+                throw new ArgumentException($"target is an existing directory, not a file: '{target}'", nameof(ops));
+
             // PackageMapper dedupliziert pro Archiv, aber Apply() ist oeffentlich und nimmt eine
             // beliebige Liste entgegen. Zwei Ops auf dasselbe Ziel wuerden die zweite Sicherung
             // ueber die (vom ersten Op bereits neu installierte) Datei ziehen statt ueber das
@@ -153,7 +234,12 @@ public static class Installer
             plan.Add((source, target, full));
         }
 
-        var opId = DateTime.Now.ToString("yyyyMMdd-HHmmss-fff");
+        // Der Zeitstempel allein ist NICHT eindeutig: zwoelf unmittelbar aufeinander folgende
+        // Apply()-Aufrufe erzeugten gemessen nur sechs verschiedene Ordnernamen (Millisekunden-
+        // Aufloesung), und der zweite Aufruf mit demselben Namen haette die unberuehrte Sicherung
+        // des ersten ueberschrieben -- ein Rollback des ersten Aufrufs haette dann die falschen
+        // Daten zurueckgespielt (Fix Round 2, Minor 2).
+        var opId = $"{DateTime.Now:yyyyMMdd-HHmmss-fff}-{Guid.NewGuid().ToString("N")[..8]}";
         var backupDir = Path.Combine(AppPaths.BackupDir, opId);
         var restored = new List<(string Backup, string Original)>();
         var written = new List<string>();
@@ -380,15 +466,24 @@ public static class Installer
             return Path.GetFullPath(enabled ? game.VersionDll : game.VersionDllDisabled);
         }
 
-        // Nur .dll-Dateien wandern nach plugins-disabled; alles andere (Configs, TOMLs, ...)
-        // bleibt an seinem kanonischen Ort, auch wenn der Mod gerade deaktiviert ist.
-        if (enabled || !file.Path.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+        if (enabled) return canonical;
+
+        // Nur .dll-Dateien UNTERHALB VON BepInEx\plugins wandern; alles andere (Configs, TOMLs,
+        // und vor allem Dateien direkt im Spielordner wie winhttp.dll) bleibt an seinem
+        // kanonischen Ort, auch wenn der Mod gerade deaktiviert ist.
+        var rel = PluginsRelative(file.Path);
+        if (rel is null || !file.Path.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
             return canonical;
 
-        // Path.GetFileName schneidet jeden Verzeichnisanteil (und damit jede Traversal-
-        // Moeglichkeit) ohnehin ab, das Ergebnis liegt also automatisch innerhalb von
-        // game.PluginsDisabled.
-        return Path.Combine(game.PluginsDisabled, Path.GetFileName(file.Path));
+        // Die Unterordnerstruktur wird GESPIEGELT, nicht abgeschnitten: mit
+        // Path.GetFileName(file.Path) fielen "BepInEx\plugins\A\Core.dll" und
+        // "BepInEx\plugins\B\Core.dll" beide auf dasselbe "plugins-disabled\Core.dll" zusammen --
+        // ein Deaktivieren beider Mods ueberschrieb die eine Datei mit der anderen, und nach dem
+        // Wieder-Aktivieren enthielt A\Core.dll den Inhalt von B, waehrend B\Core.dll ganz weg war.
+        // PackageMapper laesst beide Ziele aus EINEM Archiv zu, der Fall ist also erreichbar
+        // (Fix Round 2, I5). Als reiner Praefixtausch plugins <-> plugins-disabled bleibt das
+        // Umschalten dagegen umkehrbar.
+        return ResolveInside(game.Root, Path.Combine("BepInEx", "plugins-disabled", rel));
     }
 
     /// <summary>Sichert die aktuelle Zieldatei, falls vorhanden, bevor sie durch
@@ -403,18 +498,62 @@ public static class Installer
     {
         if (!File.Exists(to)) return;
 
-        var dir = Path.Combine(AppPaths.BackupDir, "toggle-" + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff"));
+        // Zufallsanteil wie bei Apply()s opId: der Millisekunden-Zeitstempel allein ist nicht
+        // eindeutig, und File.Copy(overwrite: true) unten wuerde eine gleichnamige aeltere
+        // Sicherung sonst still ueberschreiben (Fix Round 2, Minor 2).
+        var dir = Path.Combine(AppPaths.BackupDir,
+            $"toggle-{DateTime.Now:yyyyMMdd-HHmmss-fff}-{Guid.NewGuid().ToString("N")[..8]}");
         Directory.CreateDirectory(dir);
         var backup = Path.Combine(dir, Path.GetFileName(to));
         File.Copy(to, backup, overwrite: true);
         AppLog.Warn($"toggling {modId}: '{to}' already existed and would have been overwritten; backed it up to '{backup}' first");
     }
 
+    /// <summary>True, wenn die Datei laut Referenzzaehlung noch von einem ANDEREN, gerade
+    /// aktivierten Mod gebraucht wird. SetEnabled hat bis Fix Round 2 jede .dll aus mod.Files
+    /// verschoben, ohne state.SharedFiles ueberhaupt sehen zu koennen (die Signatur kannte den
+    /// AppState nicht): Json.dll, angeboten von modA und modB, landete beim Deaktivieren von modA
+    /// in plugins-disabled, waehrend modB aktiviert blieb -- modB konnte seine Abhaengigkeit
+    /// stillschweigend nicht mehr laden, obwohl die UI ihn als aktiv fuehrte (Fix Round 2, I1).</summary>
+    private static bool IsSharedWithAnotherEnabledMod(AppState state, ModEntry mod, string relPath)
+    {
+        var record = state.SharedFiles.FirstOrDefault(
+            f => f.Path.Equals(relPath, StringComparison.OrdinalIgnoreCase));
+        if (record is null) return false;
+
+        return record.Providers.Any(p =>
+            !p.Equals(mod.Id, StringComparison.OrdinalIgnoreCase)
+            && state.Mods.Any(m => m.Enabled && m.Id.Equals(p, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    /// <summary>Raeumt Unterebenen auf, die durch das Umschalten leer zurueckgeblieben sind --
+    /// dasselbe rein kosmetische Aufraeumen, das der Rollback in Apply() fuer selbst angelegte
+    /// Verzeichnisse macht. plugins und plugins-disabled SELBST bleiben immer stehen; entfernt
+    /// werden nur die gespiegelten Unterordner darunter, und auch die nur, wenn sie wirklich leer
+    /// sind. Tiefste zuerst, sonst haelt ein noch nicht entferntes Kind die Elternebene belegt.</summary>
+    private static void PruneEmptyToggleDirs(GameInstall game, IEnumerable<string> dirs)
+    {
+        foreach (var dir in dirs.Distinct(StringComparer.OrdinalIgnoreCase)
+                     .OrderByDescending(d => d.Count(c => c == Path.DirectorySeparatorChar)))
+        {
+            if (IsSamePath(dir, game.Plugins) || IsSamePath(dir, game.PluginsDisabled)) continue;
+            if (!IsRootOrUnder(dir, game.Plugins) && !IsRootOrUnder(dir, game.PluginsDisabled)) continue;
+
+            try
+            {
+                if (Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
+                    Directory.Delete(dir);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
     /// <summary>An/Aus per Verschieben — die Konvention, die der Bestand schon benutzt. Kann
     /// (Pre-Flight-Review Fix Round 1, M2/M3) genau wie Apply() eine InstallRollbackException
     /// werfen, wenn ein Mehrdatei-Mod nach einem Teilfehlschlag nicht vollstaendig zurueckgeschoben
-    /// werden kann.</summary>
-    public static void SetEnabled(GameInstall game, ModEntry mod, bool enabled)
+    /// werden kann. Braucht den AppState, weil eine geteilte Bibliothek nicht bewegt werden darf,
+    /// solange ein anderer, noch aktiver Mod sie benoetigt (Fix Round 2, I1).</summary>
+    public static void SetEnabled(AppState state, GameInstall game, ModEntry mod, bool enabled)
     {
         if (mod.SourceKind == "native")
         {
@@ -445,30 +584,58 @@ public static class Installer
             return;
         }
 
+        // Vorflug wie in Apply(): erst ALLE Pfade aufloesen und alle Ausschluesse entscheiden,
+        // dann erst die erste Datei bewegen. Die Aufloesung wirft bei einem Pfad, der den
+        // Spielordner verliesse, eine InvalidOperationException -- also gerade NICHT eine der
+        // beiden Ausnahmen, auf die der Rollback-Catch unten gefiltert war. Mit
+        // Files = [BepInEx\plugins\Good.dll, ..\..\Escape.dll] wurde Good.dll deshalb verschoben,
+        // der zweite Eintrag warf, KEIN Rollback lief, und mod.Enabled blieb auf dem alten Wert
+        // stehen -- PhysicalPath zeigte danach auf eine Datei, die dort nicht mehr liegt: genau
+        // die Drift zwischen Buchfuehrung und Platte, gegen die C1 existiert (Fix Round 2, I4).
+        var plan = new List<(string From, string To)>();
+        foreach (var f in mod.Files)
+        {
+            if (!f.Path.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)) continue;
+
+            if (PluginsRelative(f.Path) is null)
+            {
+                AppLog.Info($"toggling {mod.Id}: leaving '{f.Path}' where it is, only files under BepInEx\\plugins are moved");
+                continue;
+            }
+
+            if (IsSharedWithAnotherEnabledMod(state, mod, f.Path))
+            {
+                AppLog.Warn($"toggling {mod.Id}: leaving shared file '{f.Path}' in place, another enabled mod still provides it");
+                continue;
+            }
+
+            // BEIDE Seiten aus demselben kanonischen Schluessel ableiten. Ein Ziel, das statt
+            // dessen stumpf aus plugins\<Dateiname> gebaut wird, verliert die Verzeichnisstruktur:
+            // eine Datei aus "BepInEx\plugins\MyMod\X.dll" landete beim Wieder-Aktivieren in
+            // "BepInEx\plugins\X.dll", PhysicalPath zeigte danach dauerhaft ins Leere, ein
+            // spaeteres Deaktivieren fasste sie nie wieder an (sie bliebe fuer BepInEx aktiv,
+            // obwohl die UI "deaktiviert" zeigt) und Remove() liesse sie fuer immer liegen.
+            var from = PhysicalPathFor(game, mod, f, mod.Enabled); // ALTER Zustand
+            var to   = PhysicalPathFor(game, mod, f, enabled);     // NEUER Zustand
+            if (from.Equals(to, StringComparison.OrdinalIgnoreCase)) continue; // schon im Zielzustand
+
+            plan.Add((from, to));
+        }
+
         // Mehrdatei-Mods sollen nicht in einem Mischzustand enden, wenn eine mittlere Datei
         // scheitert (z. B. vom laufenden Spiel gesperrt): jede erfolgreiche Verschiebung wird
         // gemerkt, damit ein spaeterer Fehlschlag alle bereits bewegten Dateien wieder
         // zurueckschieben kann, bevor mod.Enabled ueberhaupt angefasst wird. f.Path wird dabei nie
         // veraendert (s. PhysicalPath) -- es bleibt der stabile Schluessel, unter dem state.SharedFiles
-        // dieselbe Datei womoeglich noch fuehrt.
-        // Nur die reinen Pfade: seit f.Path nie mehr umgeschrieben wird (C1), gibt es beim
-        // Zurueckrollen nichts an der Buchfuehrung wiederherzustellen -- die Datei muss nur
-        // physisch zurueck.
+        // dieselbe Datei womoeglich noch fuehrt. Nur die reinen Pfade: seit f.Path nie mehr
+        // umgeschrieben wird (C1), gibt es beim Zurueckrollen nichts an der Buchfuehrung
+        // wiederherzustellen -- die Datei muss nur physisch zurueck.
         var moved = new List<(string From, string To)>();
         try
         {
-            foreach (var f in mod.Files.Where(f => f.Path.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)))
+            foreach (var (from, to) in plan)
             {
-                // BEIDE Seiten aus demselben kanonischen Schluessel ableiten. Ein Ziel, das statt
-                // dessen stumpf aus plugins\<Dateiname> gebaut wird, verliert die Verzeichnisstruktur:
-                // eine Datei aus "BepInEx\plugins\MyMod\X.dll" landete beim Wieder-Aktivieren in
-                // "BepInEx\plugins\X.dll", PhysicalPath zeigte danach dauerhaft ins Leere, ein
-                // spaeteres Deaktivieren fasste sie nie wieder an (sie bliebe fuer BepInEx aktiv,
-                // obwohl die UI "deaktiviert" zeigt) und Remove() liesse sie fuer immer liegen.
-                var from = PhysicalPathFor(game, mod, f, mod.Enabled); // ALTER Zustand
-                var to   = PhysicalPathFor(game, mod, f, enabled);     // NEUER Zustand
-                if (from.Equals(to, StringComparison.OrdinalIgnoreCase)) continue; // schon im Zielzustand
-                if (!File.Exists(from)) continue;                                  // fehlt -- nichts zu tun
+                if (!File.Exists(from)) continue; // fehlt -- nichts zu tun
 
                 Directory.CreateDirectory(Path.GetDirectoryName(to)!);
                 BackupBeforeOverwrite(to, mod.Id);
@@ -476,7 +643,12 @@ public static class Installer
                 moved.Add((from, to));
             }
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        // Bewusst unfiltert, aus demselben Grund wie der Rollback-Catch in Apply(): die Schleife
+        // kann durch mehr als IOException/UnauthorizedAccessException unterbrochen werden (etwa
+        // eine ArgumentException aus File.Move bei einem entarteten Pfad), und in JEDEM dieser
+        // Faelle muessen die bereits verschobenen Dateien zurueck, sonst bleibt der Mod halb
+        // umgeschaltet und mod.Enabled beschreibt die Platte nicht mehr (Fix Round 2, I4).
+        catch (Exception e)
         {
             AppLog.Error($"toggling {mod.Id} failed after moving {moved.Count} file(s), rolling back", e);
             var stuck = new List<string>();
@@ -503,6 +675,7 @@ public static class Installer
             throw;
         }
 
+        PruneEmptyToggleDirs(game, moved.Select(m => Path.GetDirectoryName(m.From)!));
         mod.Enabled = enabled;
         AppLog.Info($"{mod.Id} {(enabled ? "enabled" : "disabled")}");
     }
@@ -512,11 +685,32 @@ public static class Installer
     {
         foreach (var f in mod.Files)
         {
+            // BepInEx\config\*.cfg wird NIE geloescht, nur verschoben (Spec §6.6) -- und zwar
+            // unabhaengig davon, WIE der Eintrag in mod.Files geraten ist. Ein Archiv, das seine
+            // eigene Default-Config mitliefert ("MyMod/BepInEx/config/MyMod.cfg"), bildet auf ein
+            // voellig regulaeres Ziel ab und landete damit in mod.Files -- diese Schleife hat die
+            // vom Nutzer eingestellte Config dann geloescht, und die Sicherung weiter unten fand
+            // nichts mehr vor (Fix Round 2, kritisch). Solche Eintraege werden unten gesichert.
+            if (IsProtectedConfig(f.Path)) continue;
+
             // Erst aufloesen, dann erst die Buchfuehrung anfassen: PhysicalPath wirft bei einem
             // Pfad, der den Spielordner verliesse (Pre-Flight-Review Fix Round 1, I4) -- geschaehe
             // das nach ReleaseShared, waere der Anbieter-Eintrag bereits ausgetragen, obwohl der
             // Abbruch verhindert, dass ueberhaupt je etwas geloescht wird.
-            var full = PhysicalPath(game, mod, f);
+            string full;
+            try { full = PhysicalPath(game, mod, f); }
+            catch (InvalidOperationException e)
+            {
+                // Protokollieren und ueberspringen statt werfen: ein solcher Eintrag scheitert bei
+                // JEDEM Versuch an derselben Stelle. Wuerde Remove() daran abbrechen, blieben die
+                // bereits geloeschten frueheren Dateien geloescht, waehrend der Mod fuer immer in
+                // state.Mods stehen bliebe und sich nie deinstallieren liesse -- ein einziger
+                // leerer "Path" in einer handbearbeiteten state.json genuegt dafuer
+                // (Fix Round 2, Minor 4). Geloescht wird trotzdem nichts ausserhalb.
+                AppLog.Error($"skipping file entry '{f.Path}' of {mod.Id}: it does not resolve inside the game folder", e);
+                continue;
+            }
+
             if (!ReleaseShared(state, f.Path, mod.Id)) continue;
             DeleteIfExists(full, mod.Id);
         }
@@ -533,6 +727,11 @@ public static class Installer
             var (path, sha, ver) = (shared.Path, shared.Sha256, shared.FileVersion);
             if (!ReleaseShared(state, path, mod.Id)) continue;
 
+            // Auch hier gilt der Config-Vorrang: eine geteilte Config wird verschoben, nie
+            // geloescht. ReleaseShared hat oben bereits 'true' geliefert, dieser Mod war also der
+            // letzte Anbieter -- niemand sonst verliert dadurch seine Einstellungen.
+            if (IsProtectedConfig(path)) { BackupConfigFile(game, path, mod.Id); continue; }
+
             string full;
             try
             {
@@ -545,11 +744,13 @@ public static class Installer
             }
             catch (InvalidOperationException e)
             {
-                // Noch nichts geloescht -- die Buchfuehrung wiederherstellen, statt einen
-                // Anbieter zu verlieren, ohne dass je etwas passiert ist.
-                RegisterShared(state, path, sha, ver, mod.Id);
-                AppLog.Error($"shared file path '{path}' for {mod.Id} escapes the game folder, refusing to delete", e);
-                throw;
+                // Wie in der Schleife oben: protokollieren und weitermachen, statt die
+                // Deinstallation an einem Eintrag scheitern zu lassen, der bei jedem Versuch
+                // erneut scheitern wuerde (Fix Round 2, Minor 4). Der Anbieter bleibt ausgetragen
+                // -- ein Datensatz, dessen Pfad nirgendwo hinzeigt, hilft niemandem, und geloescht
+                // wird ausserhalb des Spielordners nach wie vor nichts.
+                AppLog.Error($"skipping shared file '{path}' of {mod.Id}: it does not resolve inside the game folder", e);
+                continue;
             }
 
             try
@@ -572,6 +773,20 @@ public static class Installer
             }
         }
 
+        // Configs, die der Mod selbst mitgebracht hat: verschieben statt loeschen.
+        foreach (var f in mod.Files.Where(f => IsProtectedConfig(f.Path)))
+        {
+            // Eine GETEILTE Config gehoert der SharedFiles-Schleife oben -- nur die kennt die
+            // Referenzzaehlung. Steht der Pfad dort noch, ist dieser Mod nicht der letzte
+            // Anbieter gewesen: die Datei wegzuverschieben wuerde einem anderen, noch
+            // installierten Mod seine Einstellungen unter den Fuessen wegziehen.
+            if (state.SharedFiles.Any(s => s.Path.Equals(f.Path, StringComparison.OrdinalIgnoreCase))) continue;
+            BackupConfigFile(game, f.Path, mod.Id);
+        }
+
+        // Und zusaetzlich die nach der Mod-Id benannte Config: die legt BepInEx erst zur Laufzeit
+        // an, sie steht in keinem Archiv und taucht deshalb in keinem mod.Files-Eintrag auf.
+        // Wurde sie oben schon verschoben, findet dieser Aufruf nichts mehr vor und tut nichts.
         BackupConfig(game, mod.Id);
         state.Mods.Remove(mod);
         AppLog.Info($"removed {mod.Id}");
@@ -595,18 +810,36 @@ public static class Installer
         // vorgesehenen Ordner hinauszeigt (Pre-Flight-Review Fix Round 1, I4). ModInspector selbst
         // bleibt unveraendert -- die GUID bleibt die Identitaet des Mods, sie darf nur nie
         // ungefiltert Teil eines Pfads werden.
-        var safeId = SanitizeForFileName(modId);
+        BackupConfigFile(game, Path.Combine("BepInEx", "config", SanitizeForFileName(modId) + ".cfg"), modId);
+    }
 
+    /// <summary>Verschiebt EINE Konfigurationsdatei in den Sicherungsordner. Nie loeschen, immer
+    /// nur verschieben (Spec §6.6) -- deshalb ist ein fehlgeschlagenes Sichern auch kein
+    /// Datenverlust, die Datei bleibt dann einfach liegen.</summary>
+    private static void BackupConfigFile(GameInstall game, string relPath, string modId)
+    {
         string cfg, dest;
         try
         {
-            cfg = ResolveInside(game.Root, Path.Combine("BepInEx", "config", safeId + ".cfg"));
+            cfg = ResolveInside(game.Root, relPath);
+
+            var safeId = SanitizeForFileName(modId);
+            var stem = SanitizeForFileName(Path.GetFileNameWithoutExtension(relPath));
+            var label = stem.Equals(safeId, StringComparison.OrdinalIgnoreCase) ? safeId : $"{safeId}-{stem}";
+
+            // Sekundengenauer Zeitstempel PLUS Zufallsanteil: zwei Deinstallationen desselben Mods
+            // innerhalb derselben Sekunde erzeugten sonst denselben Zielnamen, File.Move ohne
+            // overwrite warf, und die zweite Sicherung wurde still uebersprungen -- die Config
+            // blieb liegen, aber der Nutzer bekam sie nie in den Sicherungsordner
+            // (Fix Round 2, Minor 3). Ueberschreiben ist hier bewusst KEINE Option: die aeltere
+            // Sicherung ist genauso wertvoll wie die neue.
             dest = ResolveUnder(AppPaths.ConfigBackupDir,
-                $"{safeId}-{DateTime.Now:yyyyMMdd-HHmmss}.cfg", "config backup path escapes the backup folder");
+                $"{label}-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..8]}.cfg",
+                "config backup path escapes the backup folder");
         }
         catch (InvalidOperationException e)
         {
-            AppLog.Error($"config path for mod '{modId}' would escape its folder, skipping backup", e);
+            AppLog.Error($"config path '{relPath}' for mod '{modId}' would escape its folder, skipping backup", e);
             return;
         }
 
