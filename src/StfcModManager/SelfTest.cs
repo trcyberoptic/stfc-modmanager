@@ -622,6 +622,14 @@ internal static class SelfTest
               "host: a bare IP literal is rejected");
         Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://\u0261ithub.com/x")),
               "host: a unicode homoglyph (U+0261 in place of 'g') is rejected");
+        // U+3002 IDEOGRAPHIC FULL STOP is a real IDNA label separator: Uri.Host keeps it literally
+        // ("github\u3002com", rejected by a naive string compare), but Uri.IdnHost normalizes it to
+        // "github.com" -- the form DNS/TLS actually resolve, so this URL genuinely connects to the
+        // real github.com and accepting it is correct, not a hole. This is the one case in this
+        // table where Host and IdnHost actually disagree (ground-truth measured for real under this
+        // project's InvariantGlobalization=true before writing this assert).
+        Check(GitHubClient.IsAllowedDownloadHost(new Uri("https://github\u3002com/x")),
+              "host: U+3002 (IDNA label separator) normalizes to github.com via IdnHost and is accepted");
         Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://github.com./x")),
               "host: a trailing dot (FQDN root label) is rejected");
         Check(GitHubClient.IsAllowedDownloadHost(new Uri("https://GitHub.COM/x")),

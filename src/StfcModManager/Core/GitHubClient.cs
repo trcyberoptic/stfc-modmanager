@@ -21,6 +21,15 @@ public static class GitHubClient
     // Alltag, eine gespeicherte Repo-URL zeigt dann auf den alten Namen -- ohne automatisches
     // Folgen wuerde jede Statusabfrage danach mit einem rohen HTTP 301 scheitern.
     //
+    // Das loest die Statusabfrage NICHT vollstaendig: .NET entfernt den Authorization-Header bei
+    // JEDER automatischen Weiterleitung, auch bei einer, die -- wie hier -- denselben Host trifft
+    // (an einem lokalen Server nachgemessen, nicht angenommen). Ein umbenanntes Repository wird
+    // nach dem Redirect also unauthentifiziert nachgeladen: bei einem privaten Repo sieht das dann
+    // wie "kein Release vorhanden" aus, bei einem oeffentlichen zaehlt die Anfrage gegen das
+    // anonyme 60-pro-Stunde-Kontingent statt gegen das des Tokens -- ein Token hebt das Limit fuer
+    // umbenannte Repos also NICHT an. Keine Regression dieser Aenderung: Auto-Redirect war fuer
+    // ApiHttp schon vorher an, dieses Verhalten war schon vorher da, nur bisher nicht dokumentiert.
+    //
     // DownloadHttp (github.com / *.githubusercontent.com) schaltet automatische Redirects AUS.
     // HttpClients eingebauter Redirect-Mechanismus prueft ein Umleitungsziel NICHT erneut gegen
     // unsere Host-Allowlist -- eine Weiterleitung auf einen fremden Host wuerde die Pruefung in
@@ -232,11 +241,32 @@ public static class GitHubClient
             {
                 var root = doc.RootElement;
 
-                if (root.TryGetProperty("prerelease", out var pre) && pre.GetBoolean())
+                // Gemeinsame Zuflucht fuer jede JSON-Form, die zwar gueltiges JSON, aber nicht die
+                // erwartete FORM ist ("[]", "null", "123" als Wurzel; "prerelease" als String statt
+                // bool; ein nicht-ganzzahliges "size") -- dieselbe Meldung wie bei ungueltigem JSON
+                // oben, denn fuer den Nutzer ist der Unterschied bedeutungslos, und ohne diese
+                // Waechter wuerde JsonElement direkt mit einer rohen InvalidOperationException oder
+                // FormatException abstuerzen, bevor unsere eigene Fehlerbehandlung greift.
+                InvalidOperationException UnexpectedShape(string detail)
                 {
-                    AppLog.Warn($"latest release of {owner}/{repo} is a pre-release, ignored");
-                    throw new InvalidOperationException(
-                        $"The latest release of {owner}/{repo} is marked as a pre-release and is not offered as an update.");
+                    AppLog.Error($"GitHub response for {owner}/{repo} had an unexpected shape: {detail}");
+                    return new InvalidOperationException(
+                        $"GitHub did not return the expected data for {owner}/{repo}. This can happen if a proxy or firewall is interfering with the connection.");
+                }
+
+                if (root.ValueKind != JsonValueKind.Object)
+                    throw UnexpectedShape($"root element is {root.ValueKind}, not an object");
+
+                if (root.TryGetProperty("prerelease", out var pre))
+                {
+                    if (pre.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                        throw UnexpectedShape("'prerelease' is not a boolean");
+                    if (pre.GetBoolean())
+                    {
+                        AppLog.Warn($"latest release of {owner}/{repo} is a pre-release, ignored");
+                        throw new InvalidOperationException(
+                            $"The latest release of {owner}/{repo} is marked as a pre-release and is not offered as an update.");
+                    }
                 }
 
                 if (!root.TryGetProperty("tag_name", out var tagEl) || tagEl.GetString() is not { } tag)
@@ -250,11 +280,7 @@ public static class GitHubClient
                 if (root.TryGetProperty("assets", out var arr))
                 {
                     if (arr.ValueKind != JsonValueKind.Array)
-                    {
-                        AppLog.Error($"GitHub release for {owner}/{repo} has a non-array 'assets' field");
-                        throw new InvalidOperationException(
-                            $"The latest release of {owner}/{repo} has an unexpected format. Try again later.");
-                    }
+                        throw UnexpectedShape("'assets' is not an array");
 
                     foreach (var a in arr.EnumerateArray())
                     {
@@ -265,8 +291,17 @@ public static class GitHubClient
                         // vorher da, GetProperty haette ihn nie erreicht.
                         var name = a.TryGetProperty("name", out var nameEl) ? nameEl.GetString() : null;
                         var url = a.TryGetProperty("browser_download_url", out var urlEl) ? urlEl.GetString() : null;
-                        var size = a.TryGetProperty("size", out var sizeEl) && sizeEl.ValueKind == JsonValueKind.Number
-                            ? sizeEl.GetInt64() : 0;
+
+                        long size = 0;
+                        if (a.TryGetProperty("size", out var sizeEl) && sizeEl.ValueKind == JsonValueKind.Number)
+                        {
+                            // TryGetInt64 statt GetInt64: eine Zahl, die kein ganzzahliges Int64 ist
+                            // (z. B. 1.5), besteht die ValueKind==Number-Pruefung, liesse GetInt64()
+                            // aber mit einer FormatException abstuerzen.
+                            if (!sizeEl.TryGetInt64(out size))
+                                throw UnexpectedShape("an asset's 'size' is a non-integer number");
+                        }
+
                         if (name is not null && url is not null) assets.Add(new ReleaseAsset(name, url, size));
                     }
                 }
@@ -432,7 +467,24 @@ public static class GitHubClient
                     $"Download of {asset.Name} is incomplete ({actualLength} of {expectedLength} bytes). Please try again.");
             }
 
-            File.Move(tmp, dest, overwrite: true);
+            try
+            {
+                File.Move(tmp, dest, overwrite: true);
+            }
+            catch (FileNotFoundException e)
+            {
+                // Winzig kleines Zeitfenster zwischen dem Freigeben des Datei-Handles (Ende von
+                // "await using" oben) und diesem Move: eine gleichzeitig laufende
+                // SweepOrphanedTempFiles (aus einem anderen, parallelen DownloadAssetAsync-Aufruf)
+                // koennte die eigene, gerade fertiggestellte Nebendatei in genau diesem Moment
+                // wegraeumen. Kein heutiger Aufrufer loest mehrere Downloads parallel aus, aber
+                // sollte das je passieren, ist "erneut versuchen" die richtige Handlungsanweisung
+                // -- die generische IOException-Behandlung unten ("pruefe deine Internetverbindung")
+                // waere fuer ein rein lokales Zeitfenster-Problem irrefuehrend.
+                AppLog.Error($"temp file for {asset.Name} disappeared before it could be moved into place", e);
+                throw new InvalidOperationException(
+                    $"Download of {asset.Name} could not be finalized. Please try again.", e);
+            }
         }
         catch (Exception e) when (e is HttpRequestException or IOException or UnauthorizedAccessException
                                         or OperationCanceledException or TimeoutException)
@@ -448,10 +500,14 @@ public static class GitHubClient
             if (e is OperationCanceledException or TimeoutException)
                 throw new InvalidOperationException(
                     $"Download of {asset.Name} timed out. Check your internet connection and try again.", e);
-            if (e is HttpRequestException)
+            if (e is HttpRequestException or IOException)
+                // HttpIOException (z. B. "The response ended prematurely") erbt von IOException,
+                // nicht von HttpRequestException -- ohne diesen Zweig landet der haeufigste reale
+                // Download-Fehler (Verbindungsabbruch mitten in der Uebertragung) unten im blanken
+                // "throw;" und zeigt dem Nutzer rohen Framework-Text statt einer Handlungsanweisung.
                 throw new InvalidOperationException(
                     $"Could not download {asset.Name} from GitHub. Check your internet connection and try again.", e);
-            throw;
+            throw; // UnauthorizedAccessException: lokales Problem, unveraendert weiterreichen
         }
 
         AppLog.Info($"downloaded {asset.Name} ({new FileInfo(dest).Length} bytes)");
@@ -482,15 +538,37 @@ public static class GitHubClient
         }
     }
 
+    /// <summary>Loescht nur Dateien, die exakt dem eigenen Namensschema entsprechen
+    /// ("{beliebigerAssetName}.{ProcessId}.{32-stelliges Hex-Guid}.tmp"), nicht jede beliebige
+    /// *.tmp-Datei -- destDir koennte kuenftig auch fuer andere Zwecke geteilt werden, und ein zu
+    /// breiter Filter wuerde dann fremde Dateien mitloeschen. "*.tmp" bleibt nur die grobe, billige
+    /// Vorauswahl fuer EnumerateFiles; die eigentliche Praezision liefert LooksLikeOwnTempFile.</summary>
     private static void SweepOrphanedTempFiles(string destDir)
     {
         try
         {
             foreach (var f in Directory.EnumerateFiles(destDir, "*.tmp"))
             {
+                if (!LooksLikeOwnTempFile(Path.GetFileName(f))) continue;
                 try { File.Delete(f); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
             }
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
+
+    private static bool LooksLikeOwnTempFile(string fileName)
+    {
+        // Erwartetes Schema (s. "tmp" oben in DownloadAssetAsync): "<name>.<pid>.<32-hex-guid>.tmp".
+        // Der Asset-Name selbst darf beliebig viele Punkte enthalten (z. B. Versionsnummern wie
+        // "Mod-1.2.3.zip"), deshalb wird nur an den letzten drei durch Punkt getrennten Teilen
+        // verankert, nicht an der Gesamtzahl der Punkte.
+        var parts = fileName.Split('.');
+        if (parts.Length < 4) return false;
+        var pidPart = parts[^3];
+        var guidPart = parts[^2];
+        var ext = parts[^1];
+        return ext.Equals("tmp", StringComparison.OrdinalIgnoreCase)
+            && pidPart.Length > 0 && pidPart.All(char.IsAsciiDigit)
+            && guidPart.Length == 32 && guidPart.All(Uri.IsHexDigit);
     }
 }
