@@ -1,5 +1,6 @@
 namespace StfcModManager;
 
+using System.IO.Compression;
 using StfcModManager.Core;
 
 /// <summary>
@@ -708,6 +709,15 @@ internal static class SelfTest
             Guarded("a nested plugin round-trips", () => CheckNestedPluginRoundTrip(root));
             Guarded("Apply rejects duplicates and rolls back", () => CheckApplyRejectsDuplicatesAndRollsBack(root));
             Guarded("escaping paths are refused", () => CheckEscapingPathsAreRefused(root));
+
+            // --- Task 8: BepInExRuntime ---
+            Guarded("SafeExtract rejects the escaping entry from the task brief", () => CheckSafeExtractRejectsEscapingEntries(root));
+            Guarded("SafeExtract hardening beyond the brief", () => CheckSafeExtractHardening(root));
+            Guarded("SafeExtract rejects a zip bomb", () => CheckSafeExtractZipBombRejected(root));
+            Guarded("SafeExtract happy path preserves structure", () => CheckSafeExtractHappyPath(root));
+            Guarded("SafeExtract rejects escape through a pre-existing junction", () => CheckSafeExtractRejectsReparsePointEscape(root));
+            Guarded("SafeExtract rejects a pre-existing file symlink at the target itself", () => CheckSafeExtractRejectsPreexistingFileSymlink(root));
+            Guarded("Detect hardening for partial and corrupt installs", () => CheckDetectHardening(root));
         }
         finally
         {
@@ -983,5 +993,310 @@ internal static class SelfTest
         Check(File.Exists(victim) && File.ReadAllText(victim) == "OUTSIDE",
               "fs: Remove never deletes a file that lies outside the game folder");
         Eq(state.Mods.Count, 0, "fs: Remove still completes despite the unusable entry");
+    }
+
+    // ===================================================================================
+    // Task 8: BepInExRuntime -- SafeExtract entpackt ein von aussen bezogenes Archiv direkt in den
+    // Spielordner, das ist eine Sicherheitsgrenze. Der Pflichttest aus dem Task-Brief (Schritt 1) ist
+    // hier wortgleich in der Logik uebernommen, aber an die Konventionen dieses Abschnitts angepasst --
+    // ein gemeinsamer Wegwerf-Spielordner statt eines zweiten, eigenen Temp-Mechanismus (s. Auftrag).
+    // Die weiteren Pruefungen haerten SafeExtract ueber den Pflichttest hinaus; jede einzelne pinnt
+    // einen konkreten Umgehungsversuch, s. Taskbericht fuer die Einordnung.
+    // ===================================================================================
+
+    private static string CreateZip(string path, params (string Name, string Content)[] entries)
+    {
+        using (var zs = ZipFile.Open(path, ZipArchiveMode.Create))
+        {
+            foreach (var (name, content) in entries)
+            {
+                var entry = zs.CreateEntry(name);
+                using var w = new StreamWriter(entry.Open());
+                w.Write(content);
+            }
+        }
+        return path;
+    }
+
+    /// <summary>Task-Brief Schritt 1: ein Eintrag mit ".."-Traversal darf nicht ausserhalb des
+    /// Zielordners schreiben.</summary>
+    private static void CheckSafeExtractRejectsEscapingEntries(string root)
+    {
+        var dir = Path.Combine(root, "escape-brief");
+        Directory.CreateDirectory(dir);
+        var zipPath = Path.Combine(dir, "evil.zip");
+        using (var zs = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+        {
+            var entry = zs.CreateEntry("../escaped.txt");
+            using var w = new StreamWriter(entry.Open());
+            w.Write("x");
+        }
+
+        var target = Path.Combine(dir, "dest");
+        Directory.CreateDirectory(target);
+        var threw = false;
+        try { BepInExRuntime.SafeExtract(zipPath, target); }
+        catch (InvalidOperationException) { threw = true; }
+        Check(threw, "extract: rejects entries that escape the destination");
+        Check(!File.Exists(Path.Combine(dir, "escaped.txt")), "extract: nothing written outside destination");
+    }
+
+    /// <summary>Haertung ueber den Pflichttest hinaus: jede dieser Formen entkommt der reinen
+    /// ".."-Praefixpruefung auf einem anderen Weg als woertlichem ".."-Traversal, oder gefaehrdet den
+    /// Zielordner auf andere Weise. Ein abgelehntes Archiv darf, wie der Pflichttest es fuer den
+    /// Escape-Fall verlangt, ueberhaupt nichts schreiben -- SafeExtracts Zwei-Runden-Entwurf (erst
+    /// alle Eintraege pruefen, dann erst schreiben) macht das zu einer scharfen Zusage, nicht nur zu
+    /// "der boesartige Eintrag selbst landet nicht auf der Platte".</summary>
+    private static void CheckSafeExtractHardening(string root)
+    {
+        var dir = Path.Combine(root, "harden");
+        Directory.CreateDirectory(dir);
+
+        void RejectsSingleEntry(string entryName, string what)
+        {
+            var zipPath = Path.Combine(dir, $"z-{Guid.NewGuid():N}.zip");
+            CreateZip(zipPath, (entryName, "x"));
+            var target = Path.Combine(dir, $"dest-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(target);
+
+            var threw = false;
+            try { BepInExRuntime.SafeExtract(zipPath, target); }
+            catch (InvalidOperationException) { threw = true; }
+            Check(threw, $"extract: {what}");
+            Check(!Directory.EnumerateFileSystemEntries(target).Any(),
+                  $"extract: {what} -- the rejected archive wrote nothing at all, not even inside the destination");
+        }
+
+        // Kritischer Fund (s. Taskbericht): Path.Combine(root, entryName) IGNORIERT root komplett,
+        // wenn entryName selbst gerootet ist -- die reine Praefixpruefung des Pflichttests waere hier
+        // wirkungslos, weil der kombinierte Pfad root nie enthaelt.
+        RejectsSingleEntry(@"C:\escaped-drive.txt", "rejects a drive-rooted absolute path");
+        RejectsSingleEntry("C:/escaped-drive-fwdslash.txt", "rejects a drive-rooted path with forward slashes");
+        RejectsSingleEntry(@"\\server\share\evil.dll", "rejects a UNC-style path");
+        RejectsSingleEntry("//server/share/evil.dll", "rejects a UNC-style path written with forward slashes");
+        RejectsSingleEntry("readme.txt:hidden.dll", "rejects an alternate-data-stream suffix (colon smuggles a second file)");
+        RejectsSingleEntry("MyDir/.../evil.txt", "rejects a dots-only path segment that is not literally \"..\"");
+        RejectsSingleEntry(@"..\escaped-backslash.txt", "rejects traversal expressed with backslash separators only");
+        RejectsSingleEntry("bad\0name.txt", "rejects a file name containing a character illegal on Windows (NUL byte)");
+        RejectsSingleEntry("evil?.txt", "rejects a file name containing a character illegal on Windows (?)");
+        RejectsSingleEntry("setup.exe", "rejects an executable, refusing the whole runtime archive");
+    }
+
+    /// <summary>Zip-Bomb-Schutz: eine deklarierte Gesamtgroesse ueber der (fuer den Test kuenstlich
+    /// kleinen) Obergrenze wird abgelehnt, bevor der uebergrosse Eintrag geschrieben wird -- und
+    /// dieselbe Grenze laesst ein Archiv darunter unveraendert durch, ist also eine echte Grenze,
+    /// keine versteckte Ablehnung von allem.</summary>
+    private static void CheckSafeExtractZipBombRejected(string root)
+    {
+        var dir = Path.Combine(root, "bomb");
+        Directory.CreateDirectory(dir);
+
+        var zipPath = Path.Combine(dir, "bomb.zip");
+        CreateZip(zipPath, ("payload.bin", new string('A', 2_000_000)));
+
+        var target = Path.Combine(dir, "dest");
+        Directory.CreateDirectory(target);
+        var threw = false;
+        try { BepInExRuntime.SafeExtract(zipPath, target, maxTotalUncompressedBytes: 1_000_000); }
+        catch (InvalidOperationException) { threw = true; }
+        Check(threw, "extract: rejects an archive whose declared uncompressed size exceeds the configured cap (zip-bomb guard)");
+        Check(!File.Exists(Path.Combine(target, "payload.bin")),
+              "extract: the zip-bomb guard rejects before writing the oversized entry");
+
+        var smallZip = Path.Combine(dir, "small.zip");
+        CreateZip(smallZip, ("payload.bin", "small enough"));
+        var target2 = Path.Combine(dir, "dest2");
+        Directory.CreateDirectory(target2);
+        BepInExRuntime.SafeExtract(smallZip, target2, maxTotalUncompressedBytes: 1_000_000);
+        Check(File.Exists(Path.Combine(target2, "payload.bin")), "extract: a small archive is unaffected by the zip-bomb cap");
+    }
+
+    /// <summary>Positivfall: ein plausibles BepInEx-Release entpackt korrekt, mit Ordnerstruktur und
+    /// Inhalt intakt -- die Haertung oben darf ein legitimes Archiv nicht mit abgeschossen haben.</summary>
+    private static void CheckSafeExtractHappyPath(string root)
+    {
+        var dir = Path.Combine(root, "happy");
+        Directory.CreateDirectory(dir);
+        var zipPath = Path.Combine(dir, "runtime.zip");
+        CreateZip(zipPath,
+            ("winhttp.dll", "LOADER"),
+            ("doorstop_config.ini", "[General]\nenabled=true"),
+            ("BepInEx/core/BepInEx.Core.dll", "CORE"));
+
+        var target = Path.Combine(dir, "dest");
+        Directory.CreateDirectory(target);
+        BepInExRuntime.SafeExtract(zipPath, target);
+
+        var winhttp = Path.Combine(target, "winhttp.dll");
+        Check(File.Exists(winhttp) && File.ReadAllText(winhttp) == "LOADER",
+              "extract: a legitimate loose root file extracts with its content intact");
+        Check(File.Exists(Path.Combine(target, "doorstop_config.ini")),
+              "extract: a legitimate loose root file (doorstop_config.ini) extracts");
+        var core = Path.Combine(target, "BepInEx", "core", "BepInEx.Core.dll");
+        Check(File.Exists(core) && File.ReadAllText(core) == "CORE",
+              "extract: a legitimate nested BepInEx\\core\\*.dll extracts, preserving directory structure");
+    }
+
+    /// <summary>Tiefenverteidigung gegen Reparse-Points: liegt unter dem Ziel bereits eine Junction,
+    /// die nach AUSSERHALB des Zielordners zeigt, darf SafeExtract dort nicht hindurchschreiben, auch
+    /// wenn der Zielpfad rein textuell innerhalb liegt. Junctions brauchen unter Windows keine
+    /// Elevation; kann die Testumgebung trotzdem keine anlegen, wird uebersprungen statt die Suite
+    /// scheitern zu lassen (dieselbe Konvention wie FileSystemChecks' eigener "kein beschreibbares
+    /// Temp"-Ausweg).</summary>
+    private static void CheckSafeExtractRejectsReparsePointEscape(string root)
+    {
+        var baseDir = Path.Combine(root, "rp");
+        var dest = Path.Combine(baseDir, "dest");
+        var outside = Path.Combine(baseDir, "outside");
+        Directory.CreateDirectory(dest);
+        Directory.CreateDirectory(outside);
+
+        var link = Path.Combine(dest, "BepInEx");
+        var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c mklink /J \"{link}\" \"{outside}\"")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        try
+        {
+            using var proc = System.Diagnostics.Process.Start(psi);
+            proc!.WaitForExit(10000);
+            if (proc.ExitCode != 0)
+            {
+                Console.WriteLine("fs: SafeExtract reparse-point check skipped: could not create a junction (mklink exited non-zero)");
+                return;
+            }
+        }
+        catch (Exception e) when (e is System.ComponentModel.Win32Exception or IOException)
+        {
+            Console.WriteLine($"fs: SafeExtract reparse-point check skipped: {e.GetType().Name}");
+            return;
+        }
+
+        try
+        {
+            var zipPath = Path.Combine(baseDir, "junction.zip");
+            CreateZip(zipPath, ("BepInEx/evil.dll", "PAYLOAD"));
+
+            var threw = false;
+            try { BepInExRuntime.SafeExtract(zipPath, dest); }
+            catch (InvalidOperationException) { threw = true; }
+            Check(threw, "extract: rejects a target reached through a pre-existing junction pointing outside the destination");
+            Check(!File.Exists(Path.Combine(outside, "evil.dll")),
+                  "extract: nothing written through the junction to the outside folder");
+        }
+        finally
+        {
+            // Die Junction muss VOR dem abschliessenden Directory.Delete(root, recursive: true) von
+            // FileSystemChecks weg: eine tote Junction (ihr Ziel "outside" wird als Geschwisterordner
+            // im selben Durchlauf ohnehin mitgeloescht) liess den rekursiven Loeschvorgang dort
+            // scheitern und einen leeren "rp\dest"-Rest im Temp-Ordner zuruecklassen (beobachtet).
+            // Directory.Delete OHNE recursive loescht bei einem Reparse-Point nur den Link selbst,
+            // fasst den Zielordner nicht an.
+            try { if (Directory.Exists(link)) Directory.Delete(link); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    /// <summary>Tiefenverteidigung, zweiter Fall: RejectReparsedEscape prueft nur die Eltern-
+    /// Verzeichniskette eines Ziels, nicht den Zielpfad selbst. Liegt DORT bereits ein Datei-Symlink,
+    /// wuerde File.Create ihm transparent folgen und durch ihn hindurch schreiben. Ein Datei-Symlink
+    /// braucht (anders als eine Verzeichnis-Junction) SeCreateSymbolicLinkPrivilege bzw. den
+    /// Windows-Entwicklermodus -- kann die Testumgebung keinen anlegen, wird uebersprungen statt die
+    /// Suite scheitern zu lassen.</summary>
+    private static void CheckSafeExtractRejectsPreexistingFileSymlink(string root)
+    {
+        var baseDir = Path.Combine(root, "symlink");
+        var dest = Path.Combine(baseDir, "dest");
+        var outsideFile = Path.Combine(baseDir, "outside-target.txt");
+        Directory.CreateDirectory(dest);
+        File.WriteAllText(outsideFile, "ORIGINAL_OUTSIDE_CONTENT");
+
+        var link = Path.Combine(dest, "winhttp.dll");
+        var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c mklink \"{link}\" \"{outsideFile}\"")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        try
+        {
+            using var proc = System.Diagnostics.Process.Start(psi);
+            proc!.WaitForExit(10000);
+            if (proc.ExitCode != 0)
+            {
+                Console.WriteLine("fs: SafeExtract file-symlink check skipped: could not create a file symlink "
+                                 + "(mklink exited non-zero, likely missing SeCreateSymbolicLinkPrivilege / Developer Mode)");
+                return;
+            }
+        }
+        catch (Exception e) when (e is System.ComponentModel.Win32Exception or IOException)
+        {
+            Console.WriteLine($"fs: SafeExtract file-symlink check skipped: {e.GetType().Name}");
+            return;
+        }
+
+        try
+        {
+            var zipPath = Path.Combine(baseDir, "archive.zip");
+            CreateZip(zipPath, ("winhttp.dll", "NEW_PAYLOAD"));
+
+            var threw = false;
+            try { BepInExRuntime.SafeExtract(zipPath, dest); }
+            catch (InvalidOperationException) { threw = true; }
+            Check(threw, "extract: rejects a target path that is itself a pre-existing file symlink");
+            Check(File.ReadAllText(outsideFile) == "ORIGINAL_OUTSIDE_CONTENT",
+                  "extract: the file reached through the pre-existing symlink is never overwritten");
+        }
+        finally
+        {
+            try { if (File.Exists(link)) File.Delete(link); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    /// <summary>Detect() entscheidet, ob die UI eine (Neu-)Installation anbietet. Jeder dieser Faelle
+    /// muss "nicht installiert" (null) melden, sonst bekommt der Nutzer nie das Reparatur-Angebot,
+    /// obwohl BepInEx faktisch nicht (mehr) funktionsfaehig ist.</summary>
+    private static void CheckDetectHardening(string root)
+    {
+        var g1 = new GameInstall(Path.Combine(root, "detect-loader-only"));
+        Put(g1.WinHttp, "LOADER");
+        Check(BepInExRuntime.Detect(g1) is null, "Detect: loader present but core missing reports not-installed");
+
+        var g2 = new GameInstall(Path.Combine(root, "detect-core-only"));
+        Put(g2.CoreDll, "CORE");
+        Check(BepInExRuntime.Detect(g2) is null, "Detect: core present but loader missing reports not-installed");
+
+        // Ein VORHANDENER, aber beschaedigter/abgeschnittener Kern (z. B. nach einer bei der
+        // Extraktion abgebrochenen Installation): FileVersionInfo.GetVersionInfo wirft dafuer NICHT
+        // (empirisch geprueft -- weder fuer eine leere Datei noch fuer zufaellige Bytes noch fuer
+        // reinen Text), sondern liefert ein FileVersionInfo mit leeren Feldern. Ohne die Haertung in
+        // Detect() waere das Ergebnis "" statt null -- ein Aufrufer, der auf "!= null" prueft, haette
+        // einen kaputten Kern faelschlich als "installiert" gemeldet.
+        var g3 = new GameInstall(Path.Combine(root, "detect-corrupt-core"));
+        Put(g3.WinHttp, "LOADER");
+        Put(g3.CoreDll, "this is not a valid PE file, just garbage standing in for a truncated download");
+        Check(BepInExRuntime.Detect(g3) is null,
+              "Detect: a present but corrupt/version-less core reports not-installed, not an empty string");
+
+        // Positivfall: eine echte PE-Datei mit lesbarer Version wird tatsaechlich erkannt, damit die
+        // Haertung oben den Erfolgsfall nicht versehentlich mit abgeschossen hat. Environment.ProcessPath
+        // (nicht Assembly.Location, das in einer Single-File-Veroeffentlichung "" liefert, s. IL3000)
+        // zeigt auf die gerade laufende StfcModManager.exe selbst -- eine echte, im Testlauf garantiert
+        // vorhandene PE mit Versionsressource (Version aus dem <Version>-Element im csproj).
+        var selfExe = Environment.ProcessPath;
+        if (!string.IsNullOrEmpty(selfExe) && File.Exists(selfExe))
+        {
+            var g4 = new GameInstall(Path.Combine(root, "detect-real"));
+            Put(g4.WinHttp, "LOADER");
+            Directory.CreateDirectory(Path.GetDirectoryName(g4.CoreDll)!);
+            File.Copy(selfExe, g4.CoreDll, overwrite: true);
+            var detected = BepInExRuntime.Detect(g4);
+            Check(!string.IsNullOrEmpty(detected), "Detect: a real PE with a version resource is reported as installed");
+        }
     }
 }
