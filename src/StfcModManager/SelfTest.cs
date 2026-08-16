@@ -537,6 +537,31 @@ internal static class SelfTest
         Installer.Remove(dotState, scGame, dotMod);
         Eq(dotState.Mods.Count, 0, "remove: a config path spelled with a '.' segment does not break the uninstall");
 
+        // --- Installer, Fix Round 4: der Ausweichort einer Datei ist ein eigenstaendiges Ziel ---
+        // "BepInEx\plugins-disabled\Core.dll" ist ein Pfad, den ein Archiv regulaer mitbringen darf
+        // (PackageMapper akzeptiert ihn), also ein Ort mit eigenem Besitzer -- und nicht der
+        // Zweitname des kanonischen Pfades eines anderen Mods. Remove() muss darueber hinweggehen,
+        // statt ihn als vermeintliche Zweitlage mitzuloeschen.
+        var ownGame = new GameInstall(Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-nonexistent-{Guid.NewGuid():N}"));
+        var ownState = new AppState();
+        var ownA = new ModEntry
+        {
+            Id = "ownA", Name = "A", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\Core.dll", Sha256 = "a" } }
+        };
+        var ownB = new ModEntry
+        {
+            Id = "ownB", Name = "B", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins-disabled\Core.dll", Sha256 = "b" } }
+        };
+        ownState.Mods.Add(ownA);
+        ownState.Mods.Add(ownB);
+
+        Installer.Remove(ownState, ownGame, ownA);
+        Eq(ownState.Mods.Count, 1, "remove: removing one mod leaves the other installed");
+        Eq(ownState.Mods.Count == 1 ? ownState.Mods[0].Id : null, "ownB",
+           "remove: the mod owning the plugins-disabled path is the one still there");
+
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
     }

@@ -558,11 +558,92 @@ public static class Installer
     /// verzeichnete DLL zurueck, die BepInEx munter weiterlud (Fix Round 3, wichtig). Geloescht
     /// wird deshalb, was tatsaechlich da ist -- beide Orte gehoeren derselben Datei, und die
     /// Referenzzaehlung hat bereits bestaetigt, dass sie niemand mehr braucht.</summary>
-    private static string[] PhysicalCandidates(GameInstall game, ModEntry mod, InstalledFile file)
+    private static (string Canonical, string? Alternate) PhysicalCandidates(
+        GameInstall game, ModEntry mod, InstalledFile file)
     {
-        var enabled = PhysicalPathFor(game, mod, file, true);
-        var disabled = PhysicalPathFor(game, mod, file, false);
-        return enabled.Equals(disabled, StringComparison.OrdinalIgnoreCase) ? [enabled] : [enabled, disabled];
+        // Der aktivierte Ort IST der kanonische, gespeicherte Schluessel des Eintrags -- der darf
+        // (und muss) geloescht werden, sobald die Referenzzaehlung ihn freigegeben hat.
+        var canonical = PhysicalPathFor(game, mod, file, true);
+
+        try
+        {
+            var disabled = PhysicalPathFor(game, mod, file, false);
+            return (canonical, disabled.Equals(canonical, StringComparison.OrdinalIgnoreCase) ? null : disabled);
+        }
+        catch (InvalidOperationException e)
+        {
+            // Nur der AUSWEICHORT laesst sich nicht aufloesen (etwa weil "plugins-disabled" eine
+            // Junction nach draussen ist). Das darf den Eintrag nicht als Ganzes verwerfen: sonst
+            // bliebe die kanonische Datei liegen, waehrend der Mod aus state.Mods verschwindet --
+            // genau die Verwaisung samt Drift, gegen die Fix Round 3 angetreten ist, nur durch eine
+            // engere Tuer (Fix Round 4, Minor). Vor Round 3 fasste Remove() plugins-disabled beim
+            // Entfernen eines aktivierten Mods ohnehin nie an.
+            AppLog.Error($"ignoring the alternate location of '{file.Path}' for {mod.Id}: it does not resolve inside the game folder", e);
+            return (canonical, null);
+        }
+    }
+
+    /// <summary>Der Ausweichort einer geteilten Datei, ohne zu werfen -- dieselbe Ueberlegung wie in
+    /// PhysicalCandidates, nur ohne ModEntry-Kontext.</summary>
+    private static string? TryDisabledMirror(GameInstall game, string relPath)
+    {
+        try { return DisabledMirror(game, relPath); }
+        catch (InvalidOperationException) { return null; }
+    }
+
+    /// <summary>True, wenn ein ANDERER als der gerade entfernte Mod diesen Ort fuer sich
+    /// beansprucht. Der Ausweichort ist naemlich kein blosser Zweitname des kanonischen Pfades,
+    /// sondern selbst ein eigenstaendig installierbares Ziel: PackageMapper bildet
+    /// "MyMod/BepInEx/plugins-disabled/Core.dll" unbeanstandet auf genau diesen Pfad ab, und
+    /// "version.dll_" steht ausdruecklich in PackageMapper.GameRootFiles. Er traegt damit KEINE
+    /// Referenzbeziehung zu dem Schluessel, den Remove() gerade freigegeben hat -- ihn ungeprueft
+    /// mitzuloeschen hat nachweislich fremde, noch installierte Dateien zerstoert
+    /// (Fix Round 4, wichtig). Geprueft werden beide Ableitungen jedes fremden Eintrags, nicht nur
+    /// dessen kanonischer Pfad: ein deaktivierter Mod belegt physisch seinen Ausweichort.</summary>
+    private static bool IsOwnedByAnother(AppState state, GameInstall game, ModEntry removing, string fullPath)
+    {
+        foreach (var other in state.Mods)
+        {
+            if (ReferenceEquals(other, removing)) continue; // der Mod, der ohnehin gerade geht
+            foreach (var f in other.Files)
+                foreach (var enabled in new[] { true, false })
+                {
+                    string derived;
+                    try { derived = PhysicalPathFor(game, other, f, enabled); }
+                    catch (InvalidOperationException) { continue; }
+                    if (IsSamePath(derived, fullPath)) return true;
+                }
+        }
+
+        foreach (var shared in state.SharedFiles)
+        {
+            var canonical = TryResolve(game, shared.Path);
+            if (canonical is not null && IsSamePath(canonical, fullPath)) return true;
+            var mirror = TryDisabledMirror(game, shared.Path);
+            if (mirror is not null && IsSamePath(mirror, fullPath)) return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Raeumt den Ausweichort einer freigegebenen Datei ab -- aber nur, wenn ihn wirklich
+    /// niemand sonst besitzt, und ohne seinen Inhalt je ersatzlos zu vernichten: ein
+    /// liegengebliebenes version.dll_ kann einen anderen Community-Patch-Build enthalten (genau
+    /// dafuer gibt es BackupBeforeOverwrite), deshalb wird vor dem Loeschen gesichert.</summary>
+    private static void DeleteAlternateIfUnowned(
+        AppState state, GameInstall game, ModEntry mod, string alternate, List<string> touchedDirs)
+    {
+        if (!File.Exists(alternate)) return;
+
+        if (IsOwnedByAnother(state, game, mod, alternate))
+        {
+            AppLog.Info($"leaving '{alternate}' in place while removing {mod.Id}: another installed mod owns that location");
+            return;
+        }
+
+        BackupBeforeOverwrite(alternate, mod.Id, "removing");
+        DeleteIfExists(alternate, mod.Id);
+        touchedDirs.Add(Path.GetDirectoryName(alternate)!);
     }
 
     /// <summary>Sichert die aktuelle Zieldatei, falls vorhanden, bevor sie durch
@@ -573,7 +654,7 @@ public static class Installer
     /// Sichern fehl (z. B. Backup-Ordner nicht beschreibbar), soll das genauso wie jeder andere
     /// I/O-Fehler in der aufrufenden Schleife vom bestehenden Rollback aufgefangen werden, statt
     /// die eigentliche Aktion klanglos ohne Sicherung durchzufuehren.</summary>
-    private static void BackupBeforeOverwrite(string to, string modId)
+    private static void BackupBeforeOverwrite(string to, string modId, string reason = "toggle")
     {
         if (!File.Exists(to)) return;
 
@@ -581,11 +662,11 @@ public static class Installer
         // eindeutig, und File.Copy(overwrite: true) unten wuerde eine gleichnamige aeltere
         // Sicherung sonst still ueberschreiben (Fix Round 2, Minor 2).
         var dir = Path.Combine(AppPaths.BackupDir,
-            $"toggle-{DateTime.Now:yyyyMMdd-HHmmss-fff}-{Guid.NewGuid().ToString("N")[..8]}");
+            $"{reason}-{DateTime.Now:yyyyMMdd-HHmmss-fff}-{Guid.NewGuid().ToString("N")[..8]}");
         Directory.CreateDirectory(dir);
         var backup = Path.Combine(dir, Path.GetFileName(to));
         File.Copy(to, backup, overwrite: true);
-        AppLog.Warn($"toggling {modId}: '{to}' already existed and would have been overwritten; backed it up to '{backup}' first");
+        AppLog.Warn($"{reason} of {modId}: '{to}' was about to be replaced or removed; backed it up to '{backup}' first");
     }
 
     /// <summary>True, wenn die Datei laut Referenzzaehlung noch von einem ANDEREN, gerade
@@ -791,7 +872,7 @@ public static class Installer
             // Pfad, der den Spielordner verliesse (Pre-Flight-Review Fix Round 1, I4) -- geschaehe
             // das nach ReleaseShared, waere der Anbieter-Eintrag bereits ausgetragen, obwohl der
             // Abbruch verhindert, dass ueberhaupt je etwas geloescht wird.
-            string[] candidates;
+            (string Canonical, string? Alternate) candidates;
             try { candidates = PhysicalCandidates(game, mod, f); }
             catch (InvalidOperationException e)
             {
@@ -806,11 +887,14 @@ public static class Installer
             }
 
             if (!ReleaseShared(state, f.Path, mod.Id)) continue;
-            foreach (var candidate in candidates)
-            {
-                DeleteIfExists(candidate, mod.Id);
-                touchedDirs.Add(Path.GetDirectoryName(candidate)!);
-            }
+
+            DeleteIfExists(candidates.Canonical, mod.Id);
+            touchedDirs.Add(Path.GetDirectoryName(candidates.Canonical)!);
+
+            // Der Ausweichort gehoert NICHT automatisch mit dazu -- er ist ein eigenstaendiges
+            // Ziel, das ein anderer Mod besitzen kann (s. IsOwnedByAnother).
+            if (candidates.Alternate is { } alternate)
+                DeleteAlternateIfUnowned(state, game, mod, alternate, touchedDirs);
         }
 
         // Ein Mod bringt oft mehr Dateien mit, als sein eigener Files-Eintrag zeigt: die
@@ -830,19 +914,12 @@ public static class Installer
             // letzte Anbieter -- niemand sonst verliert dadurch seine Einstellungen.
             if (IsProtectedConfig(game, path)) { BackupConfigFile(game, path, mod.Id); continue; }
 
-            string[] candidates;
+            string canonicalShared;
             try
             {
-                // Auch eine geteilte Datei kann an zwei Stellen liegen: SetEnabled verschiebt sie
-                // zwar nur, wenn kein anderer aktiver Mod sie mehr braucht -- aber dann eben doch.
-                // Beide Orte pruefen, sonst bleibt die Datei nach dem Entfernen des letzten
-                // Anbieters unverzeichnet liegen (Fix Round 3, wichtig). Die Enthaltenseins-
-                // Pruefung bleibt Pflicht: 'path' stammt aus state.json (Fix Round 1, I4).
-                var canonical = ResolveInside(game.Root, path);
-                var mirror = DisabledMirror(game, path);
-                candidates = mirror is null || mirror.Equals(canonical, StringComparison.OrdinalIgnoreCase)
-                    ? [canonical]
-                    : [canonical, mirror];
+                // Die Enthaltenseins-Pruefung bleibt Pflicht: 'path' stammt aus state.json
+                // (Fix Round 1, I4).
+                canonicalShared = ResolveInside(game.Root, path);
             }
             catch (InvalidOperationException e)
             {
@@ -855,13 +932,23 @@ public static class Installer
                 continue;
             }
 
+            // Auch eine geteilte Datei kann an zwei Stellen liegen: SetEnabled verschiebt sie zwar
+            // nur, wenn kein anderer aktiver Mod sie mehr braucht -- aber dann eben doch. Beide
+            // Orte pruefen, sonst bleibt die Datei nach dem Entfernen des letzten Anbieters
+            // unverzeichnet liegen (Fix Round 3, wichtig). Ein unaufloesbarer Ausweichort verwirft
+            // dabei nicht den ganzen Eintrag (Fix Round 4, Minor), und geloescht wird er nur, wenn
+            // ihn niemand sonst besitzt (Fix Round 4, wichtig).
+            var sharedMirror = TryDisabledMirror(game, path);
+            if (sharedMirror is not null && sharedMirror.Equals(canonicalShared, StringComparison.OrdinalIgnoreCase))
+                sharedMirror = null;
+
             try
             {
-                foreach (var candidate in candidates)
-                {
-                    DeleteIfExists(candidate, mod.Id);
-                    touchedDirs.Add(Path.GetDirectoryName(candidate)!);
-                }
+                DeleteIfExists(canonicalShared, mod.Id);
+                touchedDirs.Add(Path.GetDirectoryName(canonicalShared)!);
+
+                if (sharedMirror is not null)
+                    DeleteAlternateIfUnowned(state, game, mod, sharedMirror, touchedDirs);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
