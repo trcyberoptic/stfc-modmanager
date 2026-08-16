@@ -582,6 +582,76 @@ internal static class SelfTest
         Eq(GitHubClient.PickAsset(["notes.txt"], null), null, "asset: nothing installable needs a dialog");
         Eq(GitHubClient.PickAsset(["A.zip"], "gone.dll"), "A.zip", "asset: stale remembered name falls through");
 
+        // --- GitHubClient: InstallableCandidates -- der Baustein, mit dem ein Aufrufer
+        // "PickAsset lieferte null, weil ambig" von "PickAsset lieferte null, weil nichts
+        // installierbar da ist" unterscheiden kann, ohne die .zip/.dll-Regel selbst nachzubauen ---
+        Eq(GitHubClient.InstallableCandidates(["a.zip", "b.dll", "readme.md"]).Count, 2,
+           "candidates: zip and dll both count, readme does not");
+        Eq(GitHubClient.InstallableCandidates(["notes.txt"]).Count, 0,
+           "candidates: empty means PickAsset's null is 'nothing installable', not 'ambiguous'");
+        Eq(GitHubClient.InstallableCandidates(["a.zip", "b.zip"]).Count, 2,
+           "candidates: non-empty alongside PickAsset's null means 'ambiguous, ask the user'");
+
+        // --- GitHubClient: IsAllowedDownloadHost -- die Sicherheitsgrenze fuer Datei-Downloads.
+        // Jeder Fall hier pinnt eine konkrete Umgehung, die ein Angreifer versuchen koennte. Fuer
+        // eine Stichprobe wurde von Hand geprueft, dass der jeweils zustaendige Assert wirklich
+        // fehlschlaegt, wenn man genau die Regel bricht, die er pinnt (s. Fix-Round-Bericht).
+        Check(GitHubClient.IsAllowedDownloadHost(new Uri("https://github.com/o/r/releases/download/v1/a.zip")),
+              "host: github.com is accepted");
+        Check(GitHubClient.IsAllowedDownloadHost(new Uri("https://objects.githubusercontent.com/x")),
+              "host: objects.githubusercontent.com is accepted");
+        Check(GitHubClient.IsAllowedDownloadHost(new Uri("https://release-assets.githubusercontent.com/x")),
+              "host: release-assets.githubusercontent.com is accepted");
+        Check(GitHubClient.IsAllowedDownloadHost(new Uri("https://sub.githubusercontent.com/x")),
+              "host: an arbitrary githubusercontent.com subdomain is accepted (spec: *.githubusercontent.com)");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://sub.github.com/x")),
+              "host: github.com does NOT get the wildcard treatment -- exact match only, unlike *.githubusercontent.com");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://evil-github.com/x")),
+              "host: evil-github.com is rejected (suffix confusion, no dot boundary)");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://github.com.attacker.net/x")),
+              "host: github.com.attacker.net is rejected");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://githubusercontent.com.evil.net/x")),
+              "host: githubusercontent.com.evil.net is rejected");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://objects.githubusercontent.com.evil.net/x")),
+              "host: objects.githubusercontent.com.evil.net is rejected");
+        Check(GitHubClient.IsAllowedDownloadHost(new Uri("https://user:pw@github.com/x")),
+              "host: credentials in the URL do not hide the real (legitimate) host");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://github.com@evil.com/x")),
+              "host: 'github.com' as userinfo does not fool the check -- the real host is evil.com");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://140.82.112.3/x")),
+              "host: a bare IP literal is rejected");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://\u0261ithub.com/x")),
+              "host: a unicode homoglyph (U+0261 in place of 'g') is rejected");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://github.com./x")),
+              "host: a trailing dot (FQDN root label) is rejected");
+        Check(GitHubClient.IsAllowedDownloadHost(new Uri("https://GitHub.COM/x")),
+              "host: the match is still case-insensitive");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("https://github.com:22/a.zip")),
+              "host: a non-default port is rejected");
+        Check(GitHubClient.IsAllowedDownloadHost(new Uri("https://github.com:443/a.zip")),
+              "host: an explicit DEFAULT port is still accepted");
+        Check(!GitHubClient.IsAllowedDownloadHost(new Uri("http://github.com/x")),
+              "host: http (not https) on the real host is still rejected");
+
+        // --- GitHubClient: ResolveAllowedRedirect -- dieselbe Pruefung fuer jeden Redirect-Hop,
+        // rein und ohne Netzwerk testbar. Deckt die Faelle ab, die DownloadAssetAsync von Hand
+        // verfolgen muss, weil AllowAutoRedirect fuer den Download-Client aus ist. ---
+        var redirectBase = new Uri("https://github.com/o/r/releases/download/v1/asset.zip");
+        Check(GitHubClient.ResolveAllowedRedirect(redirectBase, null) is null,
+              "redirect: a missing Location header is refused");
+        Check(GitHubClient.ResolveAllowedRedirect(redirectBase, new Uri("//evil.com/x.zip", UriKind.RelativeOrAbsolute)) is null,
+              "redirect: a protocol-relative escape to a foreign host is refused");
+        Check(GitHubClient.ResolveAllowedRedirect(redirectBase, new Uri("http://github.com/x", UriKind.RelativeOrAbsolute)) is null,
+              "redirect: a scheme downgrade to http is refused even on the real host");
+        Check(GitHubClient.ResolveAllowedRedirect(redirectBase, new Uri("data:text/plain;base64,AAAA", UriKind.RelativeOrAbsolute)) is null,
+              "redirect: a data: target is refused");
+        Check(GitHubClient.ResolveAllowedRedirect(redirectBase, new Uri("file:///C:/evil.dll", UriKind.RelativeOrAbsolute)) is null,
+              "redirect: a file: target is refused");
+        Eq(GitHubClient.ResolveAllowedRedirect(redirectBase, new Uri("/other/path.zip", UriKind.RelativeOrAbsolute))?.Host,
+           "github.com", "redirect: a relative path resolves against the same host and is accepted");
+        Eq(GitHubClient.ResolveAllowedRedirect(redirectBase, new Uri("https://release-assets.githubusercontent.com/x", UriKind.RelativeOrAbsolute))?.Host,
+           "release-assets.githubusercontent.com", "redirect: the real CDN target GitHub actually uses is accepted");
+
         FileSystemChecks();
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
