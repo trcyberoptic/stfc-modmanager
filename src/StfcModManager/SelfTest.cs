@@ -562,6 +562,26 @@ internal static class SelfTest
         Eq(ownState.Mods.Count == 1 ? ownState.Mods[0].Id : null, "ownB",
            "remove: the mod owning the plugins-disabled path is the one still there");
 
+        // --- GitHubClient: URL-Parser ---
+        Eq(GitHubClient.ParseRepoUrl("https://github.com/trcyberoptic/STFC.NDB")?.ToString(),
+           "(trcyberoptic, STFC.NDB)", "gh: plain repo url");
+        Eq(GitHubClient.ParseRepoUrl("https://github.com/trcyberoptic/STFC.NDB/")?.ToString(),
+           "(trcyberoptic, STFC.NDB)", "gh: trailing slash");
+        Eq(GitHubClient.ParseRepoUrl("https://github.com/trcyberoptic/STFC.NDB/releases/latest")?.ToString(),
+           "(trcyberoptic, STFC.NDB)", "gh: deep link is trimmed");
+        Eq(GitHubClient.ParseRepoUrl("http://github.com/a/b"), null, "gh: http is rejected");
+        Eq(GitHubClient.ParseRepoUrl("https://gitlab.com/a/b"), null, "gh: foreign host is rejected");
+        Eq(GitHubClient.ParseRepoUrl("not a url"), null, "gh: garbage is rejected");
+
+        // --- GitHubClient: Asset-Auswahlregel (Spec §6.2) ---
+        Eq(GitHubClient.PickAsset(["A.zip", "B.dll"], "B.dll"), "B.dll", "asset: remembered name wins");
+        Eq(GitHubClient.PickAsset(["only.zip", "notes.txt"], null), "only.zip", "asset: single zip wins");
+        Eq(GitHubClient.PickAsset(["only.dll", "notes.txt"], null), "only.dll", "asset: single dll wins");
+        Eq(GitHubClient.PickAsset(["a.zip", "b.zip"], null), null, "asset: two zips need a dialog");
+        Eq(GitHubClient.PickAsset(["a.zip", "b.dll"], null), "a.zip", "asset: zip beats dll");
+        Eq(GitHubClient.PickAsset(["notes.txt"], null), null, "asset: nothing installable needs a dialog");
+        Eq(GitHubClient.PickAsset(["A.zip"], "gone.dll"), "A.zip", "asset: stale remembered name falls through");
+
         FileSystemChecks();
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
