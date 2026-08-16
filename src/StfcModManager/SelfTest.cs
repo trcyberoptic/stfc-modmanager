@@ -714,6 +714,51 @@ internal static class SelfTest
         Check(!HealthCheck.CommunityPatchConflict("# game_version = true\n"),
               "conflict: commented-out key is fine");
 
+        // --- Redactor (Spec §9, Task-Brief) ---
+        Eq(Redactor.RedactLine("ApiKey = 1234-abcd-secret"), "ApiKey = [REDACTED]", "redact: key assignment");
+        Eq(Redactor.RedactLine("deepl_api_key: abc123"), "deepl_api_key: [REDACTED]", "redact: colon separator");
+        Eq(Redactor.RedactLine("Password=hunter2"), "Password=[REDACTED]", "redact: password");
+        Eq(Redactor.RedactLine("Authorization: Bearer ey.J9.abc"), "Authorization: [REDACTED]",
+           "redact: authorization header line");
+        Eq(Redactor.RedactLine("contact me at a.b+c@example.com now"),
+           "contact me at [REDACTED-EMAIL] now", "redact: email");
+        Eq(Redactor.RedactLine("user jd73d2aac9f4b81e5c6a7d8e9f01 logged in"),
+           "user [REDACTED-ID] logged in", "redact: long alphanumeric id");
+        Eq(Redactor.RedactLine("[Info :Hellebarde] attacking hostile level 40"),
+           "[Info :Hellebarde] attacking hostile level 40", "redact: ordinary line untouched");
+        Eq(Redactor.RedactLine("MaxLevel = 40"), "MaxLevel = 40", "redact: harmless assignment untouched");
+
+        // --- Redactor: Haertung ueber die Aufgabenstellung hinaus ---
+        // Die beiden brief-eigenen Testfaelle oben ("ApiKey = ...", "deepl_api_key: ...") wuerden mit
+        // einem unveraenderten \b(?:key|...)\b bereits FEHLSCHLAGEN (\w schliesst den Unterstrich
+        // ein, \b ignoriert Gross-/Kleinschreibung) -- die folgenden Faelle pruefen die Korrektur
+        // zusaetzlich mit weiteren zusammengesetzten Bezeichnern und mit gezielten Gegenproben, damit
+        // die Grenze nicht zu einer blossen Teilstring-Suche verkommt.
+        Eq(Redactor.RedactLine("Passwort: geheim123"), "Passwort: [REDACTED]",
+           "redact: German 'Passwort' alias is recognised");
+        Eq(Redactor.RedactLine("Secret: mysecretvalue"), "Secret: [REDACTED]", "redact: standalone 'Secret' key");
+        Eq(Redactor.RedactLine("DeeplApiKey = sk-abcdef1234567890"), "DeeplApiKey = [REDACTED]",
+           "redact: a three-segment PascalCase compound ('Deepl' + 'Api' + 'Key') is still caught");
+        Eq(Redactor.RedactLine("AuthorName = John Doe"), "AuthorName = John Doe",
+           "redact: 'AuthorName' is NOT mistaken for an auth secret -- no case-transition boundary between 'Auth' and 'or'");
+        Eq(Redactor.RedactLine("MaxCapital = 5000"), "MaxCapital = 5000",
+           "redact: 'Capital' containing the substring 'api' is not falsely triggered");
+        // Bewusst grosszuegig (s. Klassenkommentar): ein zusammengesetzter Bezeichner, der zufaellig
+        // 'key' als eigenes Wortsegment enthaelt, wird trotzdem redigiert, auch wenn es hier kein
+        // echtes Geheimnis ist -- der Preis fuer die harten Faelle oben ist ein paar harmlose
+        // Übertreffer, was laut Aufgabenstellung besser ist als eine uebersehene ID.
+        Eq(Redactor.RedactLine("HotKey = F5"), "HotKey = [REDACTED]",
+           "redact: a compound word containing 'key' as its own segment is generously redacted (accepted over-masking)");
+        // GUID-Haertung: LongId allein saehe eine bindestrichgetrennte Spieler-GUID NICHT, weil die
+        // Bindestriche jede zusammenhaengende Folge unter die 24-Zeichen-Schwelle teilen.
+        Eq(Redactor.RedactLine("player 550e8400-e29b-41d4-a716-446655440000 connected"),
+           "player [REDACTED-ID] connected", "redact: a hyphenated GUID-style player id is redacted");
+        // Kehrprobe fuer dieselbe GUID-Ergaenzung steht als deliberate-break-Nachweis im Taskbericht
+        // (GuidLike() vorruebergehend entfernt, Assert direkt darueber schlaegt dann fehl).
+        Eq(Redactor.RedactText("ApiKey = supersecret\nMaxLevel = 40\n"),
+           "ApiKey = [REDACTED]" + Environment.NewLine + "MaxLevel = 40" + Environment.NewLine,
+           "redact: RedactText redacts a secret line and leaves a harmless line untouched, line by line");
+
         FileSystemChecks();
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
@@ -790,6 +835,14 @@ internal static class SelfTest
             Guarded("HealthCheck reports errors found in a real game log", () => CheckHealthCheckGameLogErrors(root));
             Guarded("HealthCheck reports orphaned files in the plugins folder", () => CheckHealthCheckOrphanFiles(root));
             Guarded("HealthCheck never throws while the game log is locked by another handle", () => CheckHealthCheckDoesNotThrowWithLockedLog(root));
+
+            // --- Task 10: Redactor / SupportBundle ---
+            Guarded("PlannedContents includes .cfg files and excludes a huge .json in the same folder", () => CheckSupportBundlePlannedContentsCfgOnly(root));
+            Guarded("PlannedContents does not throw when the config folder does not exist", () => CheckSupportBundlePlannedContentsMissingConfigFolder(root));
+            Guarded("Create redacts secrets, excludes the huge json, truncates the oversized log, and records what it dropped", () => CheckSupportBundleCreateRedactsAndRespectsCap(root));
+            Guarded("Create enforces the total budget across multiple collected files", () => CheckSupportBundleTotalBudgetExhaustion(root));
+            Guarded("Create does not throw when a source file is locked, and records it as unreadable", () => CheckSupportBundleCreateLockedSourceFile(root));
+            Guarded("Create succeeds with no config folder and no BepInEx files present at all", () => CheckSupportBundleCreateOnBareGameFolder(root));
         }
         finally
         {
@@ -1859,5 +1912,203 @@ internal static class SelfTest
         var findings = HealthCheck.Run(new AppState(), game); // darf trotz gesperrter Logdatei nicht werfen
         Check(!findings.Any(x => x.Title.StartsWith("Src:", StringComparison.Ordinal)),
               "fs: with the log file locked, HealthCheck reports no log-derived finding instead of throwing");
+    }
+
+    // ===================================================================================
+    // Task 10: Redactor / SupportBundle -- die Pruefungen hier bauen einen echten
+    // Wegwerf-Spielordner mit realistischer Durchmischung (kleine .cfg mit einem falschen
+    // API-Schluessel, ein grosses .json, ein uebergrosses Log) und pruefen das erzeugte ZIP von
+    // aussen: Inhalt, Groessenbudget, protokollierte Auslassungen und Abwesenheit jedes rohen
+    // Geheimnisses. Real auf der Zielmaschine gemessen: BepInEx\config enthaelt einen 68-MB-
+    // JSON-Cache neben den paar Kilobyte grossen .cfg-Dateien -- die Endungsregel wird hier mit
+    // einer kleineren, aber immer noch klar ueberproportionalen Datei nachgestellt (die Regel gilt
+    // unabhaengig von der absoluten Groesse, ein Test braucht die echten 68 MB nicht).
+    // ===================================================================================
+
+    /// <summary>Nur .cfg wird geplant, ein beliebig grosses .json im selben Ordner nie.</summary>
+    private static void CheckSupportBundlePlannedContentsCfgOnly(string root)
+    {
+        var gameRoot = Path.Combine(root, "sb-cfgonly");
+        var cfgPath = Put(Path.Combine(gameRoot, @"BepInEx\config\UniversalTranslator.cfg"), "ApiKey = fake\n");
+        var jsonPath = Put(Path.Combine(gameRoot, @"BepInEx\config\cache.json"), new string('x', 200_000));
+        var game = new GameInstall(gameRoot);
+
+        var planned = SupportBundle.PlannedContents(game);
+        Check(planned.Contains(cfgPath), "fs: PlannedContents includes the .cfg file in BepInEx\\config");
+        Check(!planned.Contains(jsonPath), "fs: PlannedContents excludes a non-.cfg file in the same folder, however large");
+    }
+
+    /// <summary>Kein BepInEx\config-Ordner ueberhaupt: PlannedContents darf nicht werfen (der
+    /// Vorschau-Dialog ruft diese Methode direkt auf dem UI-Thread auf).</summary>
+    private static void CheckSupportBundlePlannedContentsMissingConfigFolder(string root)
+    {
+        var gameRoot = Path.Combine(root, "sb-noconfig");
+        Directory.CreateDirectory(gameRoot); // BepInEx\config existiert bewusst nicht
+        var game = new GameInstall(gameRoot);
+
+        var planned = SupportBundle.PlannedContents(game);
+        Check(!planned.Any(p => p.EndsWith(".cfg", StringComparison.OrdinalIgnoreCase)),
+              "fs: no .cfg entries appear when the config folder does not exist");
+    }
+
+    /// <summary>Die zentrale End-zu-Ende-Pruefung mit den ECHTEN, ausgelieferten Grenzen (5 MB pro
+    /// Datei, 20 MB insgesamt): eine .cfg mit einem falschen Schluessel, ein grosses .json, ein
+    /// Log ueber der Pro-Datei-Grenze. Prueft Inhalt, Kappung, Protokollierung der Auslassung und
+    /// dass der rohe Schluessel NIRGENDS im Paket steht -- auch nicht dort, wo er ohne
+    /// Zuweisungsform im Log auftaucht.</summary>
+    private static void CheckSupportBundleCreateRedactsAndRespectsCap(string root)
+    {
+        var gameRoot = Path.Combine(root, "sb-main");
+        // Rein alphanumerisch, >=24 Zeichen, mit Ziffern -- greift unabhaengig davon, ob er hinter
+        // einem "ApiKey ="-artigen Schluesselnamen steht (SecretAssignment) oder frei im Log
+        // auftaucht (LongId als Auffangnetz).
+        const string fakeSecret = "deadbeef1234567890abcdef99887766";
+        Put(Path.Combine(gameRoot, @"BepInEx\config\UniversalTranslator.cfg"),
+            $"ApiKey = {fakeSecret}\nMaxLevel = 40\n");
+
+        Put(Path.Combine(gameRoot, @"BepInEx\config\cache.json"), new string('j', 500_000));
+
+        var logPath = Path.Combine(gameRoot, "BepInEx", "LogOutput.log");
+        Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+        using (var w = new StreamWriter(logPath))
+        {
+            for (var i = 0; i < 120_000; i++)
+                w.WriteLine($"[Info :Filler] padding line {i} to grow the file past five megabytes of content");
+            w.WriteLine($"[Error :Src] boom near the end, carries a fake token {fakeSecret} with no assignment form");
+        }
+        var logSize = new FileInfo(logPath).Length;
+        Check(logSize > 5 * 1024 * 1024,
+              $"fs: the test log is actually oversized ({logSize} bytes), or the truncation assert below would be vacuous");
+
+        var game = new GameInstall(gameRoot);
+        var destZip = Path.Combine(root, "sb-main-out", "support.zip");
+
+        SupportBundle.Create(new AppState(), game, destZip); // die OEFFENTLICHE Ueberladung, echte Grenzen
+
+        Check(File.Exists(destZip), "fs: Create wrote a zip file at the requested destination");
+
+        using var zip = ZipFile.OpenRead(destZip);
+        var names = zip.Entries.Select(e => e.FullName).ToList();
+
+        Check(names.Contains("collected/UniversalTranslator.cfg"), "fs: the .cfg file was collected");
+        Check(!names.Any(n => n.Contains("cache.json", StringComparison.OrdinalIgnoreCase)),
+              "fs: the huge .json file never appears in the zip, regardless of its size");
+        Check(names.Contains("collected/LogOutput.log"), "fs: the oversized log was still collected (tail-truncated, not dropped)");
+        Check(names.Contains("SKIPPED.txt"), "fs: SKIPPED.txt exists to record what was truncated");
+        Check(names.Contains("inventory.json") && names.Contains("environment.txt") && names.Contains("health.txt"),
+              "fs: the three self-generated files are always present");
+
+        var logEntry = zip.GetEntry("collected/LogOutput.log")!;
+        using (var r = new StreamReader(logEntry.Open()))
+        {
+            var logContent = r.ReadToEnd();
+            var logBytes = System.Text.Encoding.UTF8.GetByteCount(logContent);
+            Check(logBytes is >= 4 * 1024 * 1024 and <= 5 * 1024 * 1024 + 8192,
+                  $"fs: the collected log entry is truncated to roughly the 5 MB per-file cap ({logBytes} bytes), not the full {logSize} bytes");
+        }
+
+        var skippedEntry = zip.GetEntry("SKIPPED.txt")!;
+        using (var r = new StreamReader(skippedEntry.Open()))
+        {
+            var skippedContent = r.ReadToEnd();
+            Check(skippedContent.Contains("LogOutput.log") && skippedContent.Contains("truncated"),
+                  "fs: SKIPPED.txt names the truncated log and explains why");
+        }
+
+        // Die eigentliche Zusicherung des Redactors: das gesamte Paket enthaelt den rohen Schluessel
+        // NIRGENDS -- weder in der .cfg-Zuweisung noch im Log, wo er ohne Zuweisungsform auftaucht.
+        foreach (var entry in zip.Entries)
+        {
+            using var r = new StreamReader(entry.Open());
+            var content = r.ReadToEnd();
+            Check(!content.Contains(fakeSecret, StringComparison.Ordinal),
+                  $"fs: entry '{entry.FullName}' does not contain the raw fake secret anywhere in the package");
+        }
+
+        var cfgEntry = zip.GetEntry("collected/UniversalTranslator.cfg")!;
+        using (var r = new StreamReader(cfgEntry.Open()))
+        {
+            var cfgContent = r.ReadToEnd();
+            Check(cfgContent.Contains("ApiKey = [REDACTED]"), "fs: the collected .cfg shows the redacted form of the key");
+            Check(cfgContent.Contains("MaxLevel = 40"), "fs: the collected .cfg still shows the harmless setting in the clear");
+        }
+    }
+
+    /// <summary>Der Gesamt-Budget-Pfad, mit kuenstlich kleinen Grenzen ueber die interne
+    /// Testueberladung -- ohne echte zweistellige Megabyte an Testdaten zu schreiben. Zwei winzige
+    /// Dateien passen, eine deutlich groessere danach nicht mehr.</summary>
+    private static void CheckSupportBundleTotalBudgetExhaustion(string root)
+    {
+        var gameRoot = Path.Combine(root, "sb-budget");
+        Put(Path.Combine(gameRoot, "BepInEx", "LogOutput.log"), "hello\n");
+        Put(Path.Combine(gameRoot, "BepInEx", "ErrorLog.log"), "world\n");
+        Put(Path.Combine(gameRoot, "community_patch.log"), new string('x', 5000));
+        var game = new GameInstall(gameRoot);
+        var destZip = Path.Combine(root, "sb-budget-out", "support.zip");
+
+        SupportBundle.Create(new AppState(), game, destZip, totalBudgetBytes: 200, perFileTailBytes: 1024 * 1024);
+
+        using var zip = ZipFile.OpenRead(destZip);
+        var names = zip.Entries.Select(e => e.FullName).ToList();
+
+        Check(names.Contains("collected/LogOutput.log"), "fs: a small file well within budget is collected");
+        Check(names.Contains("collected/ErrorLog.log"), "fs: a second small file that still fits the remaining budget is collected");
+        Check(!names.Any(n => n == "collected/community_patch.log"),
+              "fs: a file whose redacted size exceeds the remaining budget is dropped, not written");
+
+        var skippedEntry = zip.GetEntry("SKIPPED.txt");
+        Check(skippedEntry is not null, "fs: SKIPPED.txt exists when the budget forces a drop");
+        if (skippedEntry is not null)
+        {
+            var skippedContent = new StreamReader(skippedEntry.Open()).ReadToEnd();
+            Check(skippedContent.Contains("community_patch.log") && skippedContent.Contains("budget"),
+                  "fs: SKIPPED.txt records exactly why the community patch log was dropped");
+        }
+    }
+
+    /// <summary>Eine geplante Quelldatei kann waehrend des Sammelns exklusiv gesperrt sein (dasselbe
+    /// Spiel-Log-Szenario wie bei HealthCheck) -- Create() darf trotzdem nicht werfen, muss die
+    /// restlichen Dateien weiter sammeln und die gesperrte Datei in SKIPPED.txt vermerken.</summary>
+    private static void CheckSupportBundleCreateLockedSourceFile(string root)
+    {
+        var gameRoot = Path.Combine(root, "sb-locked");
+        var logPath = Path.Combine(gameRoot, "BepInEx", "LogOutput.log");
+        Put(logPath, "[Error :Src] boom\n");
+        var game = new GameInstall(gameRoot);
+        var destZip = Path.Combine(root, "sb-locked-out", "support.zip");
+
+        using (new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            SupportBundle.Create(new AppState(), game, destZip); // darf trotz gesperrter Quelle nicht werfen
+        }
+
+        using var zip = ZipFile.OpenRead(destZip);
+        var skippedEntry = zip.GetEntry("SKIPPED.txt");
+        Check(skippedEntry is not null, "fs: SKIPPED.txt exists when a source file could not be read");
+        if (skippedEntry is not null)
+        {
+            var content = new StreamReader(skippedEntry.Open()).ReadToEnd();
+            Check(content.Contains("LogOutput.log") && content.Contains("could not be read"),
+                  "fs: SKIPPED.txt names the locked file and says it could not be read");
+        }
+    }
+
+    /// <summary>Ein komplett leerer Spielordner (kein BepInEx, kein Log, keine config) darf Create()
+    /// nicht werfen lassen -- die drei selbst erzeugten Dateien entstehen trotzdem.</summary>
+    private static void CheckSupportBundleCreateOnBareGameFolder(string root)
+    {
+        var gameRoot = Path.Combine(root, "sb-bare");
+        Directory.CreateDirectory(gameRoot);
+        var game = new GameInstall(gameRoot);
+        var destZip = Path.Combine(root, "sb-bare-out", "support.zip");
+
+        SupportBundle.Create(new AppState(), game, destZip);
+
+        using var zip = ZipFile.OpenRead(destZip);
+        var names = zip.Entries.Select(e => e.FullName).ToList();
+        Check(names.Contains("inventory.json") && names.Contains("environment.txt") && names.Contains("health.txt"),
+              "fs: the three self-generated files are still written even with nothing to collect");
+        Check(!names.Any(n => n.StartsWith("collected/", StringComparison.Ordinal) && n.EndsWith(".cfg")),
+              "fs: no .cfg entries when the game folder has no BepInEx config at all");
     }
 }
