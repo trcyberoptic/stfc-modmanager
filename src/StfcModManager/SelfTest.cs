@@ -684,6 +684,36 @@ internal static class SelfTest
         Check(BepInExRuntime.IsAllowedRuntimeHost(new Uri("https://builds.bepinex.dev:443/x")),
               "runtime-host: an explicit DEFAULT port is still accepted");
 
+        // --- LogReader: BepInEx-Zeilenformat (Task-Brief) ---
+        var le = LogReader.ParseLine("[Error  :   Hellebarde] NullReferenceException in AutoTasksTick");
+        Eq(le?.Level, "Error", "log: level parsed");
+        Eq(le?.Source, "Hellebarde", "log: source trimmed");
+        Eq(le?.Message, "NullReferenceException in AutoTasksTick", "log: message parsed");
+        Eq(LogReader.ParseLine("[Info   :BepInEx] loading")?.Level, "Info", "log: info line");
+        Eq(LogReader.ParseLine("plain text without brackets"), null, "log: non-matching line ignored");
+        Eq(LogReader.ParseLine("[Warning:  Buezer] slow node scan")?.Source, "Buezer", "log: warning line");
+
+        // --- LogReader: Haertung ueber den Pflichttest hinaus ---
+        Eq(LogReader.ParseLine("[Debug:X] d")?.Level, "Debug", "log: debug level recognised");
+        Eq(LogReader.ParseLine("[Message:X] m")?.Level, "Message", "log: message level recognised");
+        Eq(LogReader.ParseLine("[Fatal:X] f")?.Level, "Fatal", "log: fatal level recognised");
+        // Kleinschreibung wird bewusst NICHT akzeptiert -- die Regex traegt keine IgnoreCase-Option,
+        // ein echtes BepInEx-Log schreibt die Stufe immer exakt so gross wie oben.
+        Eq(LogReader.ParseLine("[error:X] e"), null, "log: lowercase level is not recognised (case-sensitive by design)");
+        Eq(LogReader.ParseLine("[Error:X]")?.Message, "", "log: an empty message after the closing bracket parses as an empty string, not null");
+
+        // --- HealthCheck: Community-Patch-Konflikt (Spec §8, Pruefung 6) ---
+        Check(HealthCheck.CommunityPatchConflict("[patches]\ngame_version = true\nuiscalehooks = false\n"),
+              "conflict: game_version=true is a conflict");
+        Check(HealthCheck.CommunityPatchConflict("[patches]\nuiscalehooks = true\n"),
+              "conflict: uiscalehooks=true is a conflict");
+        Check(!HealthCheck.CommunityPatchConflict("[patches]\ngame_version = false\nuiscalehooks = false\n"),
+              "conflict: both false is fine");
+        Check(!HealthCheck.CommunityPatchConflict("[graphics]\nloader_enabled = true\n"),
+              "conflict: unrelated true keys are fine");
+        Check(!HealthCheck.CommunityPatchConflict("# game_version = true\n"),
+              "conflict: commented-out key is fine");
+
         FileSystemChecks();
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
@@ -748,6 +778,18 @@ internal static class SelfTest
             Guarded("EnsureRuntimeSkeleton creates plugins and patchers", () => CheckEnsureRuntimeSkeleton(root));
             Guarded("SafeExtract keeps identity files hidden until the whole archive succeeds", () => CheckSafeExtractIdentityFilesStayHiddenUntilComplete(root));
             Guarded("Detect hardening for partial and corrupt installs", () => CheckDetectHardening(root));
+
+            // --- Task 9: LogReader / HealthCheck ---
+            Guarded("ReadTail returns nothing for a locked log file instead of throwing", () => CheckLogReaderReadTailLockedFile(root));
+            Guarded("ReadTail caps on the last raw lines before filtering by level", () => CheckLogReaderReadTailLineCap(root));
+            Guarded("HealthCheck reports a single finding for a missing game folder and does not throw", () => CheckHealthCheckMissingGameFolder(root));
+            Guarded("HealthCheck reports BepInEx missing on an otherwise valid, empty install", () => CheckHealthCheckBepInExMissing(root));
+            Guarded("HealthCheck reports a stale client build", () => CheckHealthCheckStaleClientBuild(root));
+            Guarded("HealthCheck does not throw when a mod's dll was deleted behind its back", () => CheckHealthCheckMissingModDllDoesNotThrow(root));
+            Guarded("HealthCheck reports the community patch conflict from a real file on disk", () => CheckHealthCheckCommunityPatchConflictOnDisk(root));
+            Guarded("HealthCheck reports errors found in a real game log", () => CheckHealthCheckGameLogErrors(root));
+            Guarded("HealthCheck reports orphaned files in the plugins folder", () => CheckHealthCheckOrphanFiles(root));
+            Guarded("HealthCheck never throws while the game log is locked by another handle", () => CheckHealthCheckDoesNotThrowWithLockedLog(root));
         }
         finally
         {
@@ -1615,5 +1657,207 @@ internal static class SelfTest
             var detected = BepInExRuntime.Detect(g4);
             Check(!string.IsNullOrEmpty(detected), "Detect: a real PE with a version resource is reported as installed");
         }
+    }
+
+    // ===================================================================================
+    // Task 9: LogReader / HealthCheck -- HealthCheck.Run liest den Spielordner in einem beliebigen,
+    // moeglicherweise kaputten Zustand (kein Ordner, kein BepInEx, gesperrtes Log, geloeschte DLL
+    // hinter der Buchfuehrung). Jede Pruefung hier legt echte Dateien unter dem Wegwerf-Spielordner
+    // an, damit die Zweige, die File.Exists/File.ReadAllText/Directory.EnumerateFiles tatsaechlich
+    // ausfuehren, auch wirklich durchlaufen werden -- die reinen Asserts weiter oben erreichen sie
+    // nie (dieselbe Ueberlegung wie im Kommentar ueber FileSystemChecks).
+    // ===================================================================================
+
+    /// <summary>Ein Spiel kann waehrend des Schreibens seine eigene Logdatei exklusiv halten (kein
+    /// FileShare fuer andere Prozesse). ReadTail muss dafuer eine leere Liste liefern, nicht
+    /// werfen.</summary>
+    private static void CheckLogReaderReadTailLockedFile(string root)
+    {
+        var dir = Path.Combine(root, "log-locked");
+        Directory.CreateDirectory(dir);
+        var logPath = Path.Combine(dir, "LogOutput.log");
+        File.WriteAllText(logPath, "[Error :Src] boom\n[Info :Src] fine\n");
+
+        var unlocked = LogReader.ReadTail(logPath);
+        Eq(unlocked.Count, 1, "fs: ReadTail finds the one error line when the file is not locked");
+
+        using (new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            var lockedResult = LogReader.ReadTail(logPath);
+            Eq(lockedResult.Count, 0, "fs: ReadTail returns an empty list, not a throw, when the file is exclusively locked");
+        }
+    }
+
+    /// <summary>maxLines begrenzt die zuletzt gelesenen ROHEN Zeilen, nicht die Anzahl der am Ende
+    /// gefundenen Fehler -- eine Verwechslung wuerde hier unbemerkt bleiben, wenn der Test nur die
+    /// Fehlerzahl prüfte statt WELCHE der drei Fehlerzeilen ueberlebt.</summary>
+    private static void CheckLogReaderReadTailLineCap(string root)
+    {
+        var dir = Path.Combine(root, "log-cap");
+        Directory.CreateDirectory(dir);
+        var logPath = Path.Combine(dir, "LogOutput.log");
+        var lines = new List<string>();
+        for (var i = 0; i < 7; i++) lines.Add($"[Info :Src] filler {i}");
+        lines.Add("[Error :Src] first-error");
+        lines.Add("[Error :Src] second-error");
+        lines.Add("[Error :Src] third-error");
+        File.WriteAllLines(logPath, lines);
+
+        var uncapped = LogReader.ReadTail(logPath);
+        Eq(uncapped.Count, 3, "fs: ReadTail without a tight cap finds all three error lines");
+
+        var capped = LogReader.ReadTail(logPath, maxLines: 2);
+        Eq(capped.Count, 2, "fs: ReadTail(maxLines: 2) keeps only the last two raw lines, dropping the earliest error");
+        Check(capped.All(e => e.Message is "second-error" or "third-error"),
+              "fs: the surviving entries are exactly the last two raw lines, not an arbitrary two errors");
+    }
+
+    /// <summary>Kein Spielordner ueberhaupt: die einzige Meldung nennt den echten Grund, und Run()
+    /// kehrt sofort zurueck, statt die anderen acht Pruefungen auf einem sinnlosen Pfad zu
+    /// versuchen.</summary>
+    private static void CheckHealthCheckMissingGameFolder(string root)
+    {
+        var missingRoot = Path.Combine(root, "hc-missing", Guid.NewGuid().ToString("N"));
+        var game = new GameInstall(missingRoot);
+        var findings = HealthCheck.Run(new AppState(), game);
+
+        Eq(findings.Count, 1, "fs: HealthCheck.Run on a non-existent game folder returns exactly one finding");
+        Check(findings.Count == 1 && findings[0].Severity == Severity.Error,
+              "fs: the single finding for a missing game folder is an Error");
+        Check(findings.Count == 1 && findings[0].Title.Contains("prime.exe"),
+              "fs: the finding names the missing prime.exe, not a generic message");
+    }
+
+    /// <summary>Gueltiger, beschreibbarer Spielordner, aber kein BepInEx installiert.</summary>
+    private static void CheckHealthCheckBepInExMissing(string root)
+    {
+        var gameRoot = Path.Combine(root, "hc-nobepinex");
+        Put(Path.Combine(gameRoot, "prime.exe"), "GAME");
+        var game = new GameInstall(gameRoot);
+
+        var findings = HealthCheck.Run(new AppState(), game);
+        Check(findings.Any(x => x.Title == "BepInEx is not installed."),
+              "fs: HealthCheck reports BepInEx missing on a valid game folder with no runtime installed");
+    }
+
+    /// <summary>Ein Mod, dessen InstalledAgainstClientBuild vom echten, aus .version gelesenen Build
+    /// abweicht, loest die Warnung aus -- ein passender Build tut es nicht (Kehrprobe).</summary>
+    private static void CheckHealthCheckStaleClientBuild(string root)
+    {
+        var gameRoot = Path.Combine(root, "hc-stale");
+        Put(Path.Combine(gameRoot, "prime.exe"), "GAME");
+        Put(Path.Combine(gameRoot, ".version"), "&game=254");
+        var game = new GameInstall(gameRoot);
+
+        var state = new AppState();
+        state.Mods.Add(new ModEntry { Id = "m1", Name = "M1", Version = "1.0", InstalledAgainstClientBuild = "200" });
+        var findings = HealthCheck.Run(state, game);
+        Check(findings.Any(x => x.Severity == Severity.Warning && x.Title.Contains("changed to build 254")),
+              "fs: HealthCheck reports a stale client build when a mod was installed against an older build");
+
+        var freshState = new AppState();
+        freshState.Mods.Add(new ModEntry { Id = "m1", Name = "M1", Version = "1.0", InstalledAgainstClientBuild = "254" });
+        var freshFindings = HealthCheck.Run(freshState, game);
+        Check(!freshFindings.Any(x => x.Title.Contains("changed to build")),
+              "fs: HealthCheck does not report a stale build when the installed build matches the current one");
+    }
+
+    /// <summary>Ein Mod, dessen DLL hinter dem Ruecken des Managers geloescht wurde (Buchfuehrung
+    /// zeigt noch auf sie, die Platte nicht mehr): darf Run() nicht abstuerzen lassen. ModInspector.Read
+    /// faengt IOException schon selbst ab und liefert null -- HealthCheck muss diesen null-Fall
+    /// ueberspringen, statt info.Incompatibilities auf null aufzurufen.</summary>
+    private static void CheckHealthCheckMissingModDllDoesNotThrow(string root)
+    {
+        var gameRoot = Path.Combine(root, "hc-deleted-dll");
+        Put(Path.Combine(gameRoot, "prime.exe"), "GAME");
+        var game = new GameInstall(gameRoot);
+
+        var state = new AppState();
+        state.Mods.Add(new ModEntry
+        {
+            Id = "ghost", Name = "Ghost", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\Ghost.dll", Sha256 = "g" } }
+        });
+
+        // Wirft diese Zeile, faengt Guarded() es als Fail ab -- das ist die eigentliche Pruefung.
+        var findings = HealthCheck.Run(state, game);
+        Check(!findings.Any(x => x.Title.Contains("Ghost", StringComparison.OrdinalIgnoreCase)),
+              "fs: a deleted mod dll produces no phantom incompatibility/dependency finding");
+    }
+
+    /// <summary>Pruefung 6 liest die echte community_patch_settings.toml von der Platte -- inklusive
+    /// Kehrprobe, dass beide Schalter auf false die Meldung nicht ausloest.</summary>
+    private static void CheckHealthCheckCommunityPatchConflictOnDisk(string root)
+    {
+        var gameRoot = Path.Combine(root, "hc-patchconflict");
+        Put(Path.Combine(gameRoot, "prime.exe"), "GAME");
+        Put(Path.Combine(gameRoot, "version.dll"), "NATIVE");
+        Put(Path.Combine(gameRoot, "community_patch_settings.toml"),
+            "[patches]\ngame_version = true\nuiscalehooks = false\n");
+        var game = new GameInstall(gameRoot);
+
+        var findings = HealthCheck.Run(new AppState(), game);
+        Check(findings.Any(x => x.Severity == Severity.Error && x.Title.Contains("Community Mod")),
+              "fs: HealthCheck reads the real toml on disk and reports the community patch conflict");
+
+        Put(Path.Combine(gameRoot, "community_patch_settings.toml"),
+            "[patches]\ngame_version = false\nuiscalehooks = false\n");
+        var safeFindings = HealthCheck.Run(new AppState(), game);
+        Check(!safeFindings.Any(x => x.Title.Contains("Community Mod")),
+              "fs: no community-patch finding when both switches are false on disk");
+    }
+
+    /// <summary>Pruefung 8 liest das echte LogOutput.log und zaehlt Fehler pro Quelle -- die Zahl im
+    /// Titel muss stimmen, nicht nur "irgendeine Meldung" erscheinen.</summary>
+    private static void CheckHealthCheckGameLogErrors(string root)
+    {
+        var gameRoot = Path.Combine(root, "hc-log");
+        Put(Path.Combine(gameRoot, "prime.exe"), "GAME");
+        Put(Path.Combine(gameRoot, @"BepInEx\LogOutput.log"),
+            "[Info :BepInEx] loading\n[Error :Hellebarde] NullReferenceException\n[Error :Hellebarde] second failure\n");
+        var game = new GameInstall(gameRoot);
+
+        var findings = HealthCheck.Run(new AppState(), game);
+        Check(findings.Any(x => x.Severity == Severity.Warning && x.Title == "Hellebarde: 2 error(s) in the game log."),
+              "fs: HealthCheck counts errors from the real game log per source, exact count included");
+    }
+
+    /// <summary>Pruefung 9: eine unverwaltete Datei im echten plugins-Ordner wird gemeldet, eine vom
+    /// Mod verwaltete nicht mitgezaehlt.</summary>
+    private static void CheckHealthCheckOrphanFiles(string root)
+    {
+        var gameRoot = Path.Combine(root, "hc-orphan");
+        Put(Path.Combine(gameRoot, "prime.exe"), "GAME");
+        Put(Path.Combine(gameRoot, @"BepInEx\plugins\Managed.dll"), "M");
+        Put(Path.Combine(gameRoot, @"BepInEx\plugins\Unmanaged.dll"), "U");
+        var game = new GameInstall(gameRoot);
+
+        var state = new AppState();
+        state.Mods.Add(new ModEntry
+        {
+            Id = "managed", Name = "Managed", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\Managed.dll", Sha256 = "m" } }
+        });
+
+        var findings = HealthCheck.Run(state, game);
+        Check(findings.Any(x => x.Severity == Severity.Info
+                              && x.Title == "1 file(s) in the plugins folder are not managed by this app."),
+              "fs: HealthCheck reports exactly the one orphaned file, not the managed one");
+    }
+
+    /// <summary>Das Spiel kann LogOutput.log waehrend Run() exklusiv halten -- derselbe Zustand wie
+    /// CheckLogReaderReadTailLockedFile, hier end-to-end durch HealthCheck.Run() selbst.</summary>
+    private static void CheckHealthCheckDoesNotThrowWithLockedLog(string root)
+    {
+        var gameRoot = Path.Combine(root, "hc-lockedlog");
+        Put(Path.Combine(gameRoot, "prime.exe"), "GAME");
+        var logPath = Path.Combine(gameRoot, "BepInEx", "LogOutput.log");
+        Put(logPath, "[Error :Src] boom\n");
+        var game = new GameInstall(gameRoot);
+
+        using var locked = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.None);
+        var findings = HealthCheck.Run(new AppState(), game); // darf trotz gesperrter Logdatei nicht werfen
+        Check(!findings.Any(x => x.Title.StartsWith("Src:", StringComparison.Ordinal)),
+              "fs: with the log file locked, HealthCheck reports no log-derived finding instead of throwing");
     }
 }
