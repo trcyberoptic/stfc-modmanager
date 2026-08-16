@@ -95,6 +95,14 @@ public static class BepInExRuntime
 
     private const int IdleTimeoutSeconds = 20;
 
+    // Fix Round 2: die beiden Dateien, aus denen Detect() die Identitaet einer Installation liest.
+    // SafeExtract kennt sonst keinen GameInstall-Kontext (generische Zielwurzel), deshalb hier als
+    // reine, von game.WinHttp/game.CoreDll gespiegelte Pfadkonstanten dupliziert -- s.
+    // SafeExtract-Kommentar fuer die Begruendung, warum genau diese beiden Dateien nie unter ihrem
+    // echten Namen entstehen duerfen, bevor der Rest des Archivs fertig ist.
+    private const string WinHttpRelativePath = "winhttp.dll";
+    private static readonly string CoreDllRelativePath = Path.Combine("BepInEx", "core", "BepInEx.Core.dll");
+
     /// <summary>Versionszeichenkette der installierten Laufzeit, sonst null.</summary>
     public static string? Detect(GameInstall game)
     {
@@ -377,7 +385,14 @@ public static class BepInExRuntime
     /// (kein Byte geschrieben), dann erst wird geschrieben. Damit hinterlaesst ein abgelehntes Archiv
     /// NICHTS auf der Platte, auch wenn der ungueltige Eintrag nicht der erste ist -- anders als eine
     /// Pruefen-und-Schreiben-Schleife in einem Durchgang, die bereits verarbeitete, harmlos aussehende
-    /// Eintraege stehen liesse, bevor sie auf den boesartigen stoesst.</summary>
+    /// Eintraege stehen liesse, bevor sie auf den boesartigen stoesst.
+    ///
+    /// Fix Round 2: selbst innerhalb der Schreibrunde bleiben winhttp.dll und BepInEx\core\
+    /// BepInEx.Core.dll -- die beiden Dateien, aus denen Detect() die Identitaet einer Installation
+    /// liest -- bis GANZ ZUM SCHLUSS unter einem Nebendateinamen liegen und werden erst umbenannt,
+    /// nachdem jeder andere Eintrag ohne Fehler geschrieben wurde (s. Kommentar weiter unten). Ein
+    /// Fehlschlag IRGENDWO -- auch mitten in einem spaeteren Eintrag -- erreicht die Umbenennung dann
+    /// nie, und an den beiden echten Pfaden aendert sich nichts.</summary>
     public static void SafeExtract(string zipPath, string destRoot) =>
         SafeExtract(zipPath, destRoot, MaxTotalUncompressedBytes, MaxSingleEntryBytes, MaxEntryCount);
 
@@ -408,13 +423,30 @@ public static class BepInExRuntime
         var resolvedPrefix = NormalizeRootPrefix(resolvedRoot);
         var resolvedNoSep = Path.TrimEndingDirectorySeparator(resolvedPrefix);
 
+        // Fix Round 2: die beiden Identitaetsdatei-Ziele und ihre Nebendateinamen, EINMAL vorab
+        // berechnet (reine Zeichenkettenarbeit) -- ob das Archiv sie ueberhaupt enthaelt, entscheidet
+        // sich erst weiter unten pro Eintrag. Ueberbleibsel eines hart abgebrochenen frueheren Laufs
+        // (Prozess getoetet, bevor das "finally" unten greifen konnte) vorab aufraeumen, dieselbe
+        // Ueberlegung wie SweepOrphanedTempFiles fuer den Downloadordner -- hier fuer den Spielordner,
+        // deshalb mit engerer Namenspruefung (s. SweepOrphanedIdentityTempFiles): der Spielordner ist
+        // kein von der Anwendung exklusiv verwalteter Ordner, ein zu breiter Filter koennte fremde
+        // Dateien mitloeschen.
+        var winHttpTarget = Path.GetFullPath(Path.Combine(root, WinHttpRelativePath));
+        var coreDllTarget = Path.GetFullPath(Path.Combine(root, CoreDllRelativePath));
+        var winHttpTemp = IdentityTempPath(winHttpTarget);
+        var coreDllTemp = IdentityTempPath(coreDllTarget);
+        SweepOrphanedIdentityTempFiles(winHttpTarget);
+        SweepOrphanedIdentityTempFiles(coreDllTarget);
+
         using var zip = ZipFile.OpenRead(zipPath);
 
-        var plan = new List<(ZipArchiveEntry Entry, string Full)>();
+        var plan = new List<(ZipArchiveEntry Entry, string Full, string WritePath)>();
         var targets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var neededDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         long declaredTotal = 0;
         var entryCount = 0;
+        var sawWinHttp = false;
+        var sawCoreDll = false;
 
         foreach (var entry in zip.Entries)
         {
@@ -483,35 +515,131 @@ public static class BepInExRuntime
             while (dirWalk is not null && !dirWalk.Equals(rootNoSep, StringComparison.OrdinalIgnoreCase) && neededDirs.Add(dirWalk))
                 dirWalk = Path.GetDirectoryName(dirWalk);
 
-            plan.Add((entry, full));
+            // Fix Round 2: die Buchfuehrung (targets/neededDirs/Enthaltenseins-/Reparse-Pruefung oben)
+            // bleibt an "full" -- dem ECHTEN Zielpfad -- verankert, unabhaengig davon, wohin tatsaechlich
+            // geschrieben wird. Nur die Zieldatei fuer das eigentliche Schreiben weicht fuer die beiden
+            // Identitaetsdateien auf einen Nebendateinamen im selben Verzeichnis aus (s. Klassen- und
+            // Methodenkommentar).
+            var writePath = full;
+            if (full.Equals(winHttpTarget, StringComparison.OrdinalIgnoreCase)) { writePath = winHttpTemp; sawWinHttp = true; }
+            else if (full.Equals(coreDllTarget, StringComparison.OrdinalIgnoreCase)) { writePath = coreDllTemp; sawCoreDll = true; }
+
+            plan.Add((entry, full, writePath));
         }
 
         foreach (var full in targets.Keys)
             if (neededDirs.Contains(full))
                 throw Reject($"archive entry conflicts with another entry that requires the same path to be a folder: '{full}'");
 
-        foreach (var (entry, full) in plan)
+        // Fix Round 2: der komplette Schreibvorgang (alle Eintraege, dann die beiden abschliessenden
+        // Umbenennungen) steht in einem Try/Finally, damit die Nebendateien der Identitaetsdateien in
+        // JEDEM Fall aufgeraeumt werden -- ob sie am Ende erfolgreich umbenannt wurden (dann existieren
+        // sie unter dem Nebendateinamen ohnehin nicht mehr, File.Delete im finally ist ein No-Op) oder
+        // ob ein beliebiger Eintrag davor scheiterte (dann bleibt sonst eine Nebendatei wie
+        // "BepInEx\core\BepInEx.Core.dll.1234.ab...tmp" fuer immer im Spielordner liegen -- derselbe
+        // Fehler, den DownloadArchiveAsync fuer den Downloadordner schon vermeidet).
+        try
         {
-            var dir = Path.GetDirectoryName(full)!;
-            Directory.CreateDirectory(dir);
+            foreach (var (entry, _, writePath) in plan)
+            {
+                var dir = Path.GetDirectoryName(writePath)!;
+                Directory.CreateDirectory(dir);
 
-            // Fix Round 1, I1: eine vorhandene Datei an full wurde bisher per File.Create (bzw.
-            // ExtractToFile(overwrite: true)) UEBERSCHRIEBEN, nicht ersetzt -- fuer einen normalen
-            // Reinstall harmlos, aber fuer einen Hardlink (mklink /H, KEINE Elevation noetig, anders
-            // als ein Datei-Symlink) genau der Weg hinaus: File.GetAttributes zeigt fuer einen
-            // Hardlink ganz normal "Archive" ohne Reparse-Flag, die fruehere Reparse-Point-Pruefung an
-            // dieser Stelle war dagegen blind, und ein Schreiben "durch" den Link hinein aenderte
-            // nachweislich eine Datei AUSSERHALB von destRoot. File.Delete entfernt bei einem Hardlink
-            // oder Datei-Symlink dagegen nur den Verzeichniseintrag selbst, nie das gemeinsame Ziel
-            // dahinter (auch fuer einen HAENGENDEN Symlink, dessen Ziel gar nicht mehr existiert --
-            // File.Exists war dafuer blind, File.Delete ist es nicht: ein No-Op, wenn full nicht
-            // existiert, sonst ein sauberes Entfernen genau des Links). overwrite:false danach ist
-            // Absicht, nicht Nachlaessigkeit: existiert an full trotzdem noch etwas (ein enges
-            // Zeitfenster fuer eine gleichzeitige externe Aenderung), soll ExtractToFile LAUT
-            // scheitern statt still durchzuschreiben.
-            File.Delete(full);
-            entry.ExtractToFile(full, overwrite: false);
+                // Fix Round 1, I1: eine vorhandene Datei an writePath wurde bisher per File.Create
+                // (bzw. ExtractToFile(overwrite: true)) UEBERSCHRIEBEN, nicht ersetzt -- fuer einen
+                // normalen Reinstall harmlos, aber fuer einen Hardlink (mklink /H, KEINE Elevation
+                // noetig, anders als ein Datei-Symlink) genau der Weg hinaus: File.GetAttributes zeigt
+                // fuer einen Hardlink ganz normal "Archive" ohne Reparse-Flag, die fruehere
+                // Reparse-Point-Pruefung an dieser Stelle war dagegen blind, und ein Schreiben "durch"
+                // den Link hinein aenderte nachweislich eine Datei AUSSERHALB von destRoot. File.Delete
+                // entfernt bei einem Hardlink oder Datei-Symlink dagegen nur den Verzeichniseintrag
+                // selbst, nie das gemeinsame Ziel dahinter (auch fuer einen HAENGENDEN Symlink, dessen
+                // Ziel gar nicht mehr existiert -- File.Exists war dafuer blind, File.Delete ist es
+                // nicht: ein No-Op, wenn writePath nicht existiert, sonst ein sauberes Entfernen genau
+                // des Links). overwrite:false danach ist Absicht, nicht Nachlaessigkeit: existiert an
+                // writePath trotzdem noch etwas (ein enges Zeitfenster fuer eine gleichzeitige externe
+                // Aenderung), soll ExtractToFile LAUT scheitern statt still durchzuschreiben.
+                File.Delete(writePath);
+                entry.ExtractToFile(writePath, overwrite: false);
+            }
+
+            // Fix Round 2: erst JETZT, nachdem jeder Eintrag ohne Fehler geschrieben ist, werden die
+            // beiden Identitaetsdateien von ihrem Nebendateinamen an ihren echten Platz umbenannt --
+            // eine Umbenennung innerhalb desselben Verzeichnisses ist auf demselben Volume atomar.
+            // Ohne dieses Hinauszoegern haette ein Fehlschlag GENAU auf BepInEx.Core.dll (z. B. voller
+            // Datentraeger mitten im Schreiben der 10-MB-Datei) eine abgeschnittene, aber teilweise
+            // gueltige PE-Datei am ECHTEN Pfad hinterlassen koennen -- die Versionsressource sitzt
+            // typischerweise frueh im Byte-Strom und waere unter Umstaenden trotzdem lesbar gewesen,
+            // Detect() haette den kaputten Kern faelschlich als "installiert" gemeldet. Ein Fehlschlag
+            // waehrend des Schreibens der NEBENDATEI trifft dagegen nie den echten Namen -- die
+            // Umbenennung wird schlicht nie erreicht (die Exception verlaesst die Methode weiter oben).
+            // Gleichzeitig ein willkommener Nebeneffekt bei einer Neuinstallation: schlaegt IRGENDEIN
+            // anderer Eintrag fehl, bleibt ein vorher funktionierender Stand an den echten Pfaden
+            // vollstaendig unangetastet.
+            if (sawWinHttp)
+            {
+                File.Delete(winHttpTarget);
+                File.Move(winHttpTemp, winHttpTarget);
+            }
+            if (sawCoreDll)
+            {
+                File.Delete(coreDllTarget);
+                File.Move(coreDllTemp, coreDllTarget);
+            }
         }
+        finally
+        {
+            // Best-effort, immer versucht: File.Delete auf einem nicht (mehr) vorhandenen Pfad ist ein
+            // No-Op, dieser Block ist also sowohl nach einer erfolgreichen Umbenennung (Nebendatei
+            // existiert nicht mehr) als auch nach einem Fehlschlag davor (Nebendatei liegt noch da)
+            // sicher und richtig.
+            try { File.Delete(winHttpTemp); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            try { File.Delete(coreDllTemp); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    private static string IdentityTempPath(string target) =>
+        $"{target}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
+
+    /// <summary>Raeumt Nebendateien eines fruehreren, hart abgebrochenen Laufs auf (Prozess getoetet,
+    /// bevor das "finally" in SafeExtract greifen konnte) -- dieselbe Ueberlegung wie
+    /// GitHubClient.SweepOrphanedTempFiles bzw. BepInExRuntime.SweepOrphanedTempFiles fuer den
+    /// Downloadordner, hier fuer den SPIELORDNER: nur Dateien, die EXAKT dem eigenen Namensschema
+    /// entsprechen, niemals ein grob passendes "*.tmp" -- der Spielordner ist kein von der Anwendung
+    /// exklusiv verwalteter Ordner, ein zu breiter Filter koennte fremde Dateien mitloeschen.</summary>
+    private static void SweepOrphanedIdentityTempFiles(string target)
+    {
+        var dir = Path.GetDirectoryName(target);
+        var name = Path.GetFileName(target);
+        if (dir is null || name is null || !Directory.Exists(dir)) return;
+
+        try
+        {
+            foreach (var f in Directory.EnumerateFiles(dir, $"{name}.*.tmp"))
+            {
+                if (!LooksLikeIdentityTempFile(Path.GetFileName(f), name)) continue;
+                try { File.Delete(f); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
+
+    /// <summary>Erwartetes Schema (s. IdentityTempPath): "&lt;echterName&gt;.&lt;ProzessId&gt;.
+    /// &lt;32-Hex-Guid&gt;.tmp". Wie GitHubClient.LooksLikeOwnTempFile an den LETZTEN drei durch
+    /// Punkt getrennten Teilen verankert, nicht am Gesamtaufbau -- realName selbst enthaelt bereits
+    /// Punkte ("BepInEx.Core.dll"), ein simpler Praefixvergleich waere zweideutig.</summary>
+    private static bool LooksLikeIdentityTempFile(string fileName, string realName)
+    {
+        var parts = fileName.Split('.');
+        if (parts.Length < 4) return false;
+        var namePart = string.Join('.', parts[..^3]);
+        var pidPart = parts[^3];
+        var guidPart = parts[^2];
+        var ext = parts[^1];
+        return namePart.Equals(realName, StringComparison.OrdinalIgnoreCase)
+            && ext.Equals("tmp", StringComparison.OrdinalIgnoreCase)
+            && pidPart.Length > 0 && pidPart.All(char.IsAsciiDigit)
+            && guidPart.Length == 32 && guidPart.All(Uri.IsHexDigit);
     }
 
     /// <summary>Normalisiert und prueft einen Zip-Eintragsnamen nach denselben Grundsaetzen wie

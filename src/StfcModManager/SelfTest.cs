@@ -746,6 +746,7 @@ internal static class SelfTest
             Guarded("SafeExtract rejects an over-long path segment cleanly", () => CheckSafeExtractRejectsOverlongSegment(root));
             Guarded("SafeExtract requires the destination to already exist", () => CheckSafeExtractRequiresExistingDestination(root));
             Guarded("EnsureRuntimeSkeleton creates plugins and patchers", () => CheckEnsureRuntimeSkeleton(root));
+            Guarded("SafeExtract keeps identity files hidden until the whole archive succeeds", () => CheckSafeExtractIdentityFilesStayHiddenUntilComplete(root));
             Guarded("Detect hardening for partial and corrupt installs", () => CheckDetectHardening(root));
         }
         finally
@@ -1502,6 +1503,76 @@ internal static class SelfTest
         BepInExRuntime.EnsureRuntimeSkeleton(game);
         Check(Directory.Exists(game.Plugins), "EnsureRuntimeSkeleton: BepInEx\\plugins exists afterward");
         Check(Directory.Exists(Path.Combine(gameRoot, "BepInEx", "patchers")), "EnsureRuntimeSkeleton: BepInEx\\patchers exists afterward");
+    }
+
+    /// <summary>Fix Round 2: winhttp.dll und BepInEx\core\BepInEx.Core.dll -- die beiden Dateien, aus
+    /// denen Detect() die Identitaet einer Installation liest -- duerfen unter ihrem ECHTEN Namen nie
+    /// halbfertig entstehen. Ein Verzeichnis, das exakt dort liegt, wo ein SPAETERER Archiveintrag als
+    /// Datei landen will, erzwingt einen reinen SCHREIBRUNDEN-Fehlschlag (keine der
+    /// Validierungspruefungen sieht eine Kollision mit dem bereits vorhandenen Dateisystem vorher --
+    /// die Ziel-Kollisionspruefung erkennt nur Konflikte INNERHALB des Archivs, s. dort), obwohl beide
+    /// Identitaetsdateien im Archiv VOR diesem Eintrag stehen und ihre Nebendateien laengst fertig
+    /// geschrieben waeren.
+    ///
+    /// Der BepInEx.Core.dll-Eintrag traegt bewusst ECHTE PE-Bytes (die laufende StfcModManager.exe
+    /// selbst, wie CheckDetectHardening/g4), nicht blossen Text: mit Text allein waere Detect() schon
+    /// durch seine EIGENE, unabhaengige Haertung blind fuer den Unterschied, den dieser Test pinnen
+    /// soll (eine leere/unlesbare Version meldet ohnehin "nicht installiert", Fix Round 1) -- der
+    /// Detect-Assert unten wuerde dann auch mit abgeschalteter Runde-2-Umbenennung faelschlich
+    /// bestehen. Mit einer echten, lesbaren Version wird der Assert zu einer echten Diskriminante.</summary>
+    private static void CheckSafeExtractIdentityFilesStayHiddenUntilComplete(string root)
+    {
+        var dir = Path.Combine(root, "identity");
+        Directory.CreateDirectory(dir);
+        var dest = Path.Combine(dir, "dest");
+        Directory.CreateDirectory(dest);
+
+        // Ein echtes Verzeichnis genau dort, wo der letzte Archiveintrag als DATEI landen will.
+        Directory.CreateDirectory(Path.Combine(dest, "blocked-target"));
+
+        var zipPath = Path.Combine(dir, "archive.zip");
+        using (var zs = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+        {
+            var winHttpEntry = zs.CreateEntry("winhttp.dll");
+            using (var w = new StreamWriter(winHttpEntry.Open())) w.Write("LOADER");
+
+            var coreEntry = zs.CreateEntry("BepInEx/core/BepInEx.Core.dll");
+            using (var es = coreEntry.Open())
+            {
+                var selfExe = Environment.ProcessPath;
+                if (!string.IsNullOrEmpty(selfExe) && File.Exists(selfExe))
+                {
+                    using var fs = File.OpenRead(selfExe);
+                    fs.CopyTo(es);
+                }
+                else
+                {
+                    es.Write("CORE"u8);
+                }
+            }
+
+            var blockedEntry = zs.CreateEntry("blocked-target");
+            using (var w = new StreamWriter(blockedEntry.Open())) w.Write("THIS ENTRY FAILS TO WRITE");
+        }
+
+        var threw = false;
+        try { BepInExRuntime.SafeExtract(zipPath, dest); }
+        catch (Exception) { threw = true; } // IOException/UnauthorizedAccessException from the real filesystem clash, not a clean InvalidOperationException rejection
+        Check(threw, "extract: a later entry that fails to write still aborts the whole install");
+
+        Check(!File.Exists(Path.Combine(dest, "winhttp.dll")),
+              "extract: winhttp.dll never reaches its real name when a later entry fails to write, even though its own write already succeeded");
+        Check(!File.Exists(Path.Combine(dest, "BepInEx", "core", "BepInEx.Core.dll")),
+              "extract: BepInEx.Core.dll (a real, readable PE this time) never reaches its real name when a later entry fails to write, even though its own write already succeeded");
+
+        var leftoverTemps = Directory.Exists(dest)
+            ? Directory.EnumerateFiles(dest, "*.tmp", SearchOption.AllDirectories).ToArray()
+            : Array.Empty<string>();
+        Check(leftoverTemps.Length == 0,
+              $"extract: no leftover identity temp files after the failed install (found: {string.Join(", ", leftoverTemps)})");
+
+        Check(BepInExRuntime.Detect(new GameInstall(dest)) is null,
+              "extract: Detect reports not-installed after a partial extraction that failed on a later entry, even though the core carries a genuinely readable version");
     }
 
     /// <summary>Detect() entscheidet, ob die UI eine (Neu-)Installation anbietet. Jeder dieser Faelle
