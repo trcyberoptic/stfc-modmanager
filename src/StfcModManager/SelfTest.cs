@@ -661,6 +661,29 @@ internal static class SelfTest
         Eq(GitHubClient.ResolveAllowedRedirect(redirectBase, new Uri("https://release-assets.githubusercontent.com/x", UriKind.RelativeOrAbsolute))?.Host,
            "release-assets.githubusercontent.com", "redirect: the real CDN target GitHub actually uses is accepted");
 
+        // --- BepInExRuntime.IsAllowedRuntimeHost -- Fix Round 1: the runtime download previously used
+        // a default HttpClient (auto-redirect on, no host check at all). Same spirit as
+        // GitHubClient.IsAllowedDownloadHost above, deliberately narrower: exactly one pinned host,
+        // no wildcard subdomain family (none is known for bepinex.dev's build server). ---
+        Check(BepInExRuntime.IsAllowedRuntimeHost(new Uri("https://builds.bepinex.dev/projects/x/755/a.zip")),
+              "runtime-host: builds.bepinex.dev over https is accepted");
+        Check(BepInExRuntime.IsAllowedRuntimeHost(new Uri("https://BUILDS.BEPINEX.DEV/x")),
+              "runtime-host: the match is case-insensitive");
+        Check(!BepInExRuntime.IsAllowedRuntimeHost(new Uri("http://builds.bepinex.dev/x")),
+              "runtime-host: http (not https) on the real host is rejected");
+        Check(!BepInExRuntime.IsAllowedRuntimeHost(new Uri("https://evil.com/x")),
+              "runtime-host: an unrelated host is rejected");
+        Check(!BepInExRuntime.IsAllowedRuntimeHost(new Uri("https://cdn.bepinex.dev/x")),
+              "runtime-host: no wildcard subdomain family -- a different bepinex.dev subdomain is rejected");
+        Check(!BepInExRuntime.IsAllowedRuntimeHost(new Uri("https://builds.bepinex.dev.evil.com/x")),
+              "runtime-host: builds.bepinex.dev.evil.com (suffix confusion) is rejected");
+        Check(!BepInExRuntime.IsAllowedRuntimeHost(new Uri("https://evil-builds.bepinex.dev/x")),
+              "runtime-host: evil-builds.bepinex.dev (prefix confusion, no dot boundary) is rejected");
+        Check(!BepInExRuntime.IsAllowedRuntimeHost(new Uri("https://builds.bepinex.dev:8443/x")),
+              "runtime-host: a non-default port is rejected");
+        Check(BepInExRuntime.IsAllowedRuntimeHost(new Uri("https://builds.bepinex.dev:443/x")),
+              "runtime-host: an explicit DEFAULT port is still accepted");
+
         FileSystemChecks();
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
@@ -713,10 +736,16 @@ internal static class SelfTest
             // --- Task 8: BepInExRuntime ---
             Guarded("SafeExtract rejects the escaping entry from the task brief", () => CheckSafeExtractRejectsEscapingEntries(root));
             Guarded("SafeExtract hardening beyond the brief", () => CheckSafeExtractHardening(root));
-            Guarded("SafeExtract rejects a zip bomb", () => CheckSafeExtractZipBombRejected(root));
+            Guarded("SafeExtract zip-bomb caps (count, per-entry, total)", () => CheckSafeExtractZipBombCaps(root));
             Guarded("SafeExtract happy path preserves structure", () => CheckSafeExtractHappyPath(root));
-            Guarded("SafeExtract rejects escape through a pre-existing junction", () => CheckSafeExtractRejectsReparsePointEscape(root));
-            Guarded("SafeExtract rejects a pre-existing file symlink at the target itself", () => CheckSafeExtractRejectsPreexistingFileSymlink(root));
+            Guarded("SafeExtract rejects escape through a pre-existing junction (validation-time, nested entry)", () => CheckSafeExtractRejectsReparsePointEscape(root));
+            Guarded("SafeExtract severs a pre-existing file symlink at the target itself", () => CheckSafeExtractSeversPreexistingFileSymlink(root));
+            Guarded("SafeExtract severs a pre-existing hard link at the target itself", () => CheckSafeExtractSeversPreexistingHardLink(root));
+            Guarded("SafeExtract rejects duplicate targets and file/directory collisions", () => CheckSafeExtractRejectsTargetCollisions(root));
+            Guarded("SafeExtract rejects reserved DOS device names", () => CheckSafeExtractRejectsDosDeviceNames(root));
+            Guarded("SafeExtract rejects an over-long path segment cleanly", () => CheckSafeExtractRejectsOverlongSegment(root));
+            Guarded("SafeExtract requires the destination to already exist", () => CheckSafeExtractRequiresExistingDestination(root));
+            Guarded("EnsureRuntimeSkeleton creates plugins and patchers", () => CheckEnsureRuntimeSkeleton(root));
             Guarded("Detect hardening for partial and corrupt installs", () => CheckDetectHardening(root));
         }
         finally
@@ -1082,33 +1111,76 @@ internal static class SelfTest
         RejectsSingleEntry("setup.exe", "rejects an executable, refusing the whole runtime archive");
     }
 
-    /// <summary>Zip-Bomb-Schutz: eine deklarierte Gesamtgroesse ueber der (fuer den Test kuenstlich
-    /// kleinen) Obergrenze wird abgelehnt, bevor der uebergrosse Eintrag geschrieben wird -- und
-    /// dieselbe Grenze laesst ein Archiv darunter unveraendert durch, ist also eine echte Grenze,
-    /// keine versteckte Ablehnung von allem.</summary>
-    private static void CheckSafeExtractZipBombRejected(string root)
+    /// <summary>Zip-Bomb-Schutz, Fix Round 1 (I2): die fruehere "Stufe 2" (tatsaechlich beim Kopieren
+    /// gelesene Bytes gegen die Grenze zaehlen) war toter Code -- ZipArchiveEntry.Open() schneidet den
+    /// Stream nachweislich auf die DEKLARIERTE Laenge ab (empirisch gemessen: ein Eintrag, der 10 Bytes
+    /// deklariert und 4.000.000 tatsaechlich enthaelt, liefert beim Lesen exakt 10 Bytes), der Wurf
+    /// konnte also nie feuern. Ersetzt durch drei unabhaengige, aus reinen Metadaten geprueften
+    /// Grenzen -- jede hier einzeln mit einem Positiv- und einem Negativfall gepinnt, damit ein
+    /// zukuenftiger Regress (z. B. eine Grenze, die versehentlich nie greift) tatsaechlich auffaellt.
+    /// Fuer jede Grenze wurde waehrend der Entwicklung von Hand geprueft, dass das Entfernen bzw.
+    /// Aufweichen der jeweiligen Pruefung genau diesen Assert zum Scheitern bringt (s. Taskbericht).</summary>
+    private static void CheckSafeExtractZipBombCaps(string root)
     {
         var dir = Path.Combine(root, "bomb");
         Directory.CreateDirectory(dir);
 
-        var zipPath = Path.Combine(dir, "bomb.zip");
-        CreateZip(zipPath, ("payload.bin", new string('A', 2_000_000)));
+        // Gesamtgroesse: ein einzelner 2-MB-Eintrag ueber einer kuenstlich auf 1 MB gesenkten
+        // Gesamtgrenze wird abgelehnt, bevor er geschrieben wird.
+        var totalZip = Path.Combine(dir, "total.zip");
+        CreateZip(totalZip, ("payload.bin", new string('A', 2_000_000)));
+        var totalTarget = Path.Combine(dir, "total-dest");
+        Directory.CreateDirectory(totalTarget);
+        var totalThrew = false;
+        try { BepInExRuntime.SafeExtract(totalZip, totalTarget, maxTotalUncompressedBytes: 1_000_000, maxSingleEntryBytes: 50_000_000, maxEntryCount: 100); }
+        catch (InvalidOperationException) { totalThrew = true; }
+        Check(totalThrew, "extract: rejects an archive whose declared TOTAL uncompressed size exceeds the configured cap (zip-bomb guard)");
+        Check(!File.Exists(Path.Combine(totalTarget, "payload.bin")),
+              "extract: the total-size zip-bomb guard rejects before writing the oversized entry");
 
-        var target = Path.Combine(dir, "dest");
-        Directory.CreateDirectory(target);
-        var threw = false;
-        try { BepInExRuntime.SafeExtract(zipPath, target, maxTotalUncompressedBytes: 1_000_000); }
-        catch (InvalidOperationException) { threw = true; }
-        Check(threw, "extract: rejects an archive whose declared uncompressed size exceeds the configured cap (zip-bomb guard)");
-        Check(!File.Exists(Path.Combine(target, "payload.bin")),
-              "extract: the zip-bomb guard rejects before writing the oversized entry");
+        // Pro Eintrag: derselbe 2-MB-Eintrag besteht eine grosszuegige Gesamtgrenze, wird aber ueber
+        // einer kuenstlich auf 1 MB gesenkten PRO-EINTRAG-Grenze trotzdem abgelehnt -- eine reine
+        // Gesamtsummen-Pruefung haette das nicht erkannt.
+        var perEntryZip = Path.Combine(dir, "perentry.zip");
+        CreateZip(perEntryZip, ("payload.bin", new string('A', 2_000_000)));
+        var perEntryTarget = Path.Combine(dir, "perentry-dest");
+        Directory.CreateDirectory(perEntryTarget);
+        var perEntryThrew = false;
+        try { BepInExRuntime.SafeExtract(perEntryZip, perEntryTarget, maxTotalUncompressedBytes: 50_000_000, maxSingleEntryBytes: 1_000_000, maxEntryCount: 100); }
+        catch (InvalidOperationException) { perEntryThrew = true; }
+        Check(perEntryThrew, "extract: rejects a SINGLE archive entry whose declared size exceeds the configured per-entry cap");
+        Check(!File.Exists(Path.Combine(perEntryTarget, "payload.bin")),
+              "extract: the per-entry zip-bomb guard rejects before writing the oversized entry");
 
+        // Anzahl: 20 winzige Eintraege bestehen grosszuegige Groessengrenzen, werden aber ueber einer
+        // kuenstlich auf 10 gesenkten Anzahl-Grenze trotzdem abgelehnt -- reproduziert im Kleinen, was
+        // bei 20.000 winzigen Eintraegen 8,8 s ohne jede Grenze kostete (Fix Round 1, I2).
+        var countZip = Path.Combine(dir, "count.zip");
+        using (var zs = ZipFile.Open(countZip, ZipArchiveMode.Create))
+            for (var i = 0; i < 20; i++)
+            {
+                var entry = zs.CreateEntry($"tiny{i}.bin");
+                using var w = new StreamWriter(entry.Open());
+                w.Write("x");
+            }
+        var countTarget = Path.Combine(dir, "count-dest");
+        Directory.CreateDirectory(countTarget);
+        var countThrew = false;
+        try { BepInExRuntime.SafeExtract(countZip, countTarget, maxTotalUncompressedBytes: 50_000_000, maxSingleEntryBytes: 50_000_000, maxEntryCount: 10); }
+        catch (InvalidOperationException) { countThrew = true; }
+        Check(countThrew, "extract: rejects an archive with more entries than the configured count cap");
+        Check(!Directory.EnumerateFileSystemEntries(countTarget).Any(),
+              "extract: the entry-count zip-bomb guard rejects before writing any of the entries");
+
+        // Positivfall, alle drei Grenzen zugleich: ein winziges Archiv bleibt unter allen drei
+        // (kuenstlich gesenkten) Grenzen unbehelligt -- die Pruefungen sind echte Grenzen, keine
+        // versteckte Ablehnung von allem.
         var smallZip = Path.Combine(dir, "small.zip");
         CreateZip(smallZip, ("payload.bin", "small enough"));
-        var target2 = Path.Combine(dir, "dest2");
-        Directory.CreateDirectory(target2);
-        BepInExRuntime.SafeExtract(smallZip, target2, maxTotalUncompressedBytes: 1_000_000);
-        Check(File.Exists(Path.Combine(target2, "payload.bin")), "extract: a small archive is unaffected by the zip-bomb cap");
+        var smallTarget = Path.Combine(dir, "small-dest");
+        Directory.CreateDirectory(smallTarget);
+        BepInExRuntime.SafeExtract(smallZip, smallTarget, maxTotalUncompressedBytes: 1_000_000, maxSingleEntryBytes: 1_000_000, maxEntryCount: 10);
+        Check(File.Exists(Path.Combine(smallTarget, "payload.bin")), "extract: a small archive is unaffected by any of the three zip-bomb caps");
     }
 
     /// <summary>Positivfall: ein plausibles BepInEx-Release entpackt korrekt, mit Ordnerstruktur und
@@ -1142,7 +1214,18 @@ internal static class SelfTest
     /// wenn der Zielpfad rein textuell innerhalb liegt. Junctions brauchen unter Windows keine
     /// Elevation; kann die Testumgebung trotzdem keine anlegen, wird uebersprungen statt die Suite
     /// scheitern zu lassen (dieselbe Konvention wie FileSystemChecks' eigener "kein beschreibbares
-    /// Temp"-Ausweg).</summary>
+    /// Temp"-Ausweg).
+    ///
+    /// Fix Round 1, I3: der urspruengliche Test benutzte ein Archiv mit GENAU EINEM, nicht
+    /// verschachtelten Eintrag ("BepInEx/evil.dll") -- damit war Directory.CreateDirectory auf der
+    /// bereits vorhandenen Junction ein reiner No-Op, und der Assert bestand auch mit der (damals noch
+    /// in der Schreibrunde laufenden) Pruefung, ohne die eigentliche Regel zu pinnen: die Pruefung lief
+    /// dort PRO bereits angelegtem bzw. vorhandenem Verzeichnis, nicht vorab. Jetzt zwei Eintraege --
+    /// ein harmloser "good.dll" direkt im Ziel und ein verschachtelter
+    /// "BepInEx/plugins/evil.dll" hinter der Junction --, damit eine zu spaete Pruefung sichtbar
+    /// wuerde: sie haette "outside\plugins" angelegt (das Verzeichnis unter dem Junction-Ziel, das nur
+    /// der verschachtelte Eintrag braucht) UND "good.dll" bereits geschrieben, bevor sie ueberhaupt
+    /// griffe.</summary>
     private static void CheckSafeExtractRejectsReparsePointEscape(string root)
     {
         var baseDir = Path.Combine(root, "rp");
@@ -1178,14 +1261,19 @@ internal static class SelfTest
         try
         {
             var zipPath = Path.Combine(baseDir, "junction.zip");
-            CreateZip(zipPath, ("BepInEx/evil.dll", "PAYLOAD"));
+            CreateZip(zipPath, ("good.dll", "HARMLESS"), ("BepInEx/plugins/evil.dll", "PAYLOAD"));
 
             var threw = false;
             try { BepInExRuntime.SafeExtract(zipPath, dest); }
             catch (InvalidOperationException) { threw = true; }
             Check(threw, "extract: rejects a target reached through a pre-existing junction pointing outside the destination");
-            Check(!File.Exists(Path.Combine(outside, "evil.dll")),
+            Check(!File.Exists(Path.Combine(outside, "plugins", "evil.dll")),
                   "extract: nothing written through the junction to the outside folder");
+            Check(!Directory.Exists(Path.Combine(outside, "plugins")),
+                  "extract: the rejection happens before validation creates any directory through the junction "
+                + "(Fix Round 1, I3 -- the old write-time check let CreateDirectory run first)");
+            Check(!File.Exists(Path.Combine(dest, "good.dll")),
+                  "extract: a harmless entry earlier in the archive is not written either -- the whole archive is rejected");
         }
         finally
         {
@@ -1200,13 +1288,13 @@ internal static class SelfTest
         }
     }
 
-    /// <summary>Tiefenverteidigung, zweiter Fall: RejectReparsedEscape prueft nur die Eltern-
-    /// Verzeichniskette eines Ziels, nicht den Zielpfad selbst. Liegt DORT bereits ein Datei-Symlink,
-    /// wuerde File.Create ihm transparent folgen und durch ihn hindurch schreiben. Ein Datei-Symlink
-    /// braucht (anders als eine Verzeichnis-Junction) SeCreateSymbolicLinkPrivilege bzw. den
-    /// Windows-Entwicklermodus -- kann die Testumgebung keinen anlegen, wird uebersprungen statt die
-    /// Suite scheitern zu lassen.</summary>
-    private static void CheckSafeExtractRejectsPreexistingFileSymlink(string root)
+    /// <summary>Fix Round 1, I1: File.Create/ExtractToFile(overwrite: true) folgt einem bereits
+    /// vorhandenen Datei-Symlink am Zielpfad transparent und schreibt DURCH ihn hindurch -- entdeckt
+    /// als "reject", jetzt korrigiert zu "erst loeschen, dann frisch anlegen" (s. SafeExtract-
+    /// Kommentar bei File.Delete). Ein Datei-Symlink braucht (anders als eine Verzeichnis-Junction)
+    /// SeCreateSymbolicLinkPrivilege bzw. den Windows-Entwicklermodus -- kann die Testumgebung keinen
+    /// anlegen, wird uebersprungen statt die Suite scheitern zu lassen.</summary>
+    private static void CheckSafeExtractSeversPreexistingFileSymlink(string root)
     {
         var baseDir = Path.Combine(root, "symlink");
         var dest = Path.Combine(baseDir, "dest");
@@ -1244,18 +1332,176 @@ internal static class SelfTest
             var zipPath = Path.Combine(baseDir, "archive.zip");
             CreateZip(zipPath, ("winhttp.dll", "NEW_PAYLOAD"));
 
-            var threw = false;
-            try { BepInExRuntime.SafeExtract(zipPath, dest); }
-            catch (InvalidOperationException) { threw = true; }
-            Check(threw, "extract: rejects a target path that is itself a pre-existing file symlink");
+            BepInExRuntime.SafeExtract(zipPath, dest);
+            Check(File.ReadAllText(link) == "NEW_PAYLOAD",
+                  "extract: the target path now holds the archive's content as a fresh, unlinked file");
             Check(File.ReadAllText(outsideFile) == "ORIGINAL_OUTSIDE_CONTENT",
-                  "extract: the file reached through the pre-existing symlink is never overwritten");
+                  "extract: the file reached through the severed symlink is never touched");
         }
         finally
         {
             try { if (File.Exists(link)) File.Delete(link); }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         }
+    }
+
+    /// <summary>Fix Round 1, I1 -- the finding itself: a hard link (mklink /H) at a leaf target needs
+    /// NO elevation, unlike a file symlink, and File.GetAttributes shows a completely ordinary
+    /// "Archive" attribute for it with no reparse-point flag -- the old leaf check (gated on a reparse
+    /// attribute) was structurally blind to this, the cheapest variant of the exact threat it meant to
+    /// stop. Verified empirically before fixing: writing through the old (overwrite-in-place) approach
+    /// changed the outside file's content; File.Delete followed by a fresh create does not. This check
+    /// runs for real in every environment (no privilege needed), unlike the file-symlink case above.</summary>
+    private static void CheckSafeExtractSeversPreexistingHardLink(string root)
+    {
+        var baseDir = Path.Combine(root, "hardlink");
+        var dest = Path.Combine(baseDir, "dest");
+        var outsideFile = Path.Combine(baseDir, "outside-victim.txt");
+        Directory.CreateDirectory(dest);
+        File.WriteAllText(outsideFile, "ORIGINAL_VICTIM_CONTENT");
+
+        var link = Path.Combine(dest, "winhttp.dll");
+        var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c mklink /H \"{link}\" \"{outsideFile}\"")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        using (var proc = System.Diagnostics.Process.Start(psi))
+        {
+            proc!.WaitForExit(10000);
+            Check(proc.ExitCode == 0, "fs: mklink /H succeeds without elevation (hard link precondition for this check)");
+        }
+
+        Check(!File.GetAttributes(link).HasFlag(FileAttributes.ReparsePoint),
+              "fs: a hard link carries no reparse-point attribute -- the old leaf check was structurally blind to it");
+
+        var zipPath = Path.Combine(baseDir, "archive.zip");
+        CreateZip(zipPath, ("winhttp.dll", "NEW_PAYLOAD"));
+
+        BepInExRuntime.SafeExtract(zipPath, dest);
+        Check(File.ReadAllText(link) == "NEW_PAYLOAD",
+              "extract: the target path now holds the archive's content as a fresh, unlinked file");
+        Check(File.ReadAllText(outsideFile) == "ORIGINAL_VICTIM_CONTENT",
+              "extract: the hard-linked outside file is never touched -- File.Delete severed the link instead of writing through it");
+    }
+
+    /// <summary>Fix Round 1, kleiner Befund: PackageMapper lehnt Ziel-Kollisionen fuer Modarchive schon
+    /// ab; SafeExtract tat das nicht. Ohne diese Pruefung ueberschreiben sich zwei Eintraege auf
+    /// denselben Zielpfad (auch nur in Gross-/Kleinschreibung unterschiedlich) still gegenseitig, und
+    /// ein Eintrag, dessen Pfad ein ANDERER Eintrag als Ordner braucht, endet je nach Reihenfolge
+    /// entweder in einer rohen IOException oder in einem Teil-Install.</summary>
+    private static void CheckSafeExtractRejectsTargetCollisions(string root)
+    {
+        var dir = Path.Combine(root, "collide");
+        Directory.CreateDirectory(dir);
+
+        void RejectsCollision(string label, (string, string)[] entries)
+        {
+            var zipPath = Path.Combine(dir, $"{label}.zip");
+            CreateZip(zipPath, entries);
+            var target = Path.Combine(dir, $"{label}-dest");
+            Directory.CreateDirectory(target);
+
+            var threw = false;
+            try { BepInExRuntime.SafeExtract(zipPath, target); }
+            catch (InvalidOperationException) { threw = true; }
+            Check(threw, $"extract: rejects target collision '{label}'");
+            Check(!Directory.EnumerateFileSystemEntries(target).Any(),
+                  $"extract: target collision '{label}' -- nothing written at all");
+        }
+
+        RejectsCollision("exact-dup", new[] { ("a.dll", "A1"), ("a.dll", "A2") });
+        RejectsCollision("case-dup", new[] { ("a.dll", "A1"), ("A.DLL", "A2") });
+        RejectsCollision("file-then-dir", new[] { ("BepInEx", "FILE"), ("BepInEx/core/x.dll", "NESTED") });
+        RejectsCollision("dir-then-file", new[] { ("BepInEx/core/x.dll", "NESTED"), ("BepInEx", "FILE") });
+    }
+
+    /// <summary>Fix Round 1, kleiner Befund: DOS-reservierte Geraetenamen (CON, NUL, COM1, ...) wurden
+    /// bisher nur "zufaellig" ueber die Enthaltenseins-Pruefung abgelehnt (Path.GetFullPath bildet sie
+    /// auf ein Geraet ab, das nie unter root liegt, empirisch geprueft), mit der irrefuehrenden
+    /// Meldung "escapes the destination". Jetzt explizit geprueft; die Meldung nennt den richtigen
+    /// Grund.</summary>
+    private static void CheckSafeExtractRejectsDosDeviceNames(string root)
+    {
+        var dir = Path.Combine(root, "dosnames");
+        Directory.CreateDirectory(dir);
+
+        foreach (var name in new[] { "CON", "CON.dll", "NUL.txt", "COM1.dll", "LPT1.dll" })
+        {
+            var zipPath = Path.Combine(dir, $"z-{Guid.NewGuid():N}.zip");
+            CreateZip(zipPath, (name, "x"));
+            var target = Path.Combine(dir, $"dest-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(target);
+
+            InvalidOperationException? caught = null;
+            try { BepInExRuntime.SafeExtract(zipPath, target); }
+            catch (InvalidOperationException e) { caught = e; }
+            Check(caught is not null, $"extract: rejects reserved DOS device name '{name}'");
+            Check(caught is not null && caught.Message.Contains("reserved DOS device name", StringComparison.OrdinalIgnoreCase),
+                  $"extract: '{name}' is rejected with the actual reason, not a misleading 'escapes the destination'");
+            Check(!Directory.EnumerateFileSystemEntries(target).Any(), $"extract: '{name}' -- nothing written");
+        }
+    }
+
+    /// <summary>Fix Round 1, kleiner Befund: a single path segment over 255 characters is a hard NTFS
+    /// limit that Path.GetFullPath does NOT reject (measured: it succeeds even for a combined path
+    /// over 5000 characters long) -- the failure only surfaces at the actual write, as a raw,
+    /// OS-LOCALIZED IOException (German text observed: "Die Syntax fuer den Dateinamen... ist
+    /// falsch."). Must be caught in validation, both for a clean English message and so the
+    /// write-nothing guarantee holds.</summary>
+    private static void CheckSafeExtractRejectsOverlongSegment(string root)
+    {
+        var dir = Path.Combine(root, "longname");
+        Directory.CreateDirectory(dir);
+
+        var longSegment = new string('b', 300) + ".dll";
+        var zipPath = Path.Combine(dir, "archive.zip");
+        CreateZip(zipPath, (longSegment, "x"));
+        var target = Path.Combine(dir, "dest");
+        Directory.CreateDirectory(target);
+
+        InvalidOperationException? caught = null;
+        try { BepInExRuntime.SafeExtract(zipPath, target); }
+        catch (InvalidOperationException e) { caught = e; }
+        Check(caught is not null, "extract: rejects a path segment longer than 255 characters");
+        Check(caught is not null && !caught.Message.Contains("Datei", StringComparison.OrdinalIgnoreCase)
+                                   && !caught.Message.Contains("Syntax", StringComparison.OrdinalIgnoreCase),
+              "extract: the rejection message is the clean English one, not a leaked OS-localized IOException");
+        Check(!Directory.EnumerateFileSystemEntries(target).Any(), "extract: nothing written for the over-long segment");
+    }
+
+    /// <summary>Fix Round 1, kleiner Befund: SafeExtract used to call Directory.CreateDirectory(destRoot)
+    /// unconditionally, so a mistyped game path was silently created and "installed into" -- the user
+    /// would see apparent success in a folder that is not the game at all. The destination must already
+    /// exist; SafeExtract never creates it.</summary>
+    private static void CheckSafeExtractRequiresExistingDestination(string root)
+    {
+        var missing = Path.Combine(root, "missing-dest", $"{Guid.NewGuid():N}");
+        var zipPath = Path.Combine(root, "for-missing-dest.zip");
+        CreateZip(zipPath, ("winhttp.dll", "x"));
+
+        var threw = false;
+        try { BepInExRuntime.SafeExtract(zipPath, missing); }
+        catch (InvalidOperationException) { threw = true; }
+        Check(threw, "extract: rejects a destination folder that does not exist");
+        Check(!Directory.Exists(missing), "extract: a rejected destination is never silently created");
+    }
+
+    /// <summary>Fix Round 1, kleiner Befund: the archive ships "BepInEx\plugins" and "BepInEx\patchers"
+    /// only as empty directory entries (for user content -- BepInEx itself never puts anything there),
+    /// which SafeExtract always skips (it only ever creates directories that a FILE entry needs). Cheap
+    /// insurance, tested directly since InstallAsync's network call cannot run in the offline self-test.</summary>
+    private static void CheckEnsureRuntimeSkeleton(string root)
+    {
+        var gameRoot = Path.Combine(root, "skeleton");
+        Directory.CreateDirectory(gameRoot);
+        var game = new GameInstall(gameRoot);
+
+        BepInExRuntime.EnsureRuntimeSkeleton(game);
+        Check(Directory.Exists(game.Plugins), "EnsureRuntimeSkeleton: BepInEx\\plugins exists afterward");
+        Check(Directory.Exists(Path.Combine(gameRoot, "BepInEx", "patchers")), "EnsureRuntimeSkeleton: BepInEx\\patchers exists afterward");
     }
 
     /// <summary>Detect() entscheidet, ob die UI eine (Neu-)Installation anbietet. Jeder dieser Faelle
