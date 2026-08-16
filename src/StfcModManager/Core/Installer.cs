@@ -27,10 +27,43 @@ public static class Installer
     /// benutzt.</summary>
     private static string ResolveUnder(string root, string relativeTarget, string errorContext)
     {
-        var full = Path.GetFullPath(Path.Combine(root, relativeTarget));
+        // Ein Pfad, den Path.GetFullPath gar nicht erst verarbeiten kann (verbotene Zeichen, zu
+        // lang), wird wie jeder andere Enthaltenseins-Fehlschlag behandelt statt seine eigene
+        // Ausnahmeart nach aussen zu tragen: die Aufrufer fangen genau InvalidOperationException,
+        // um so einen Eintrag zu ueberspringen -- eine durchgereichte ArgumentException risse
+        // Remove() stattdessen ab und liesse den Mod fuer immer in state.Mods stehen
+        // (Fix Round 3, Minor 2).
+        string full;
+        try { full = Path.GetFullPath(Path.Combine(root, relativeTarget)); }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            throw new InvalidOperationException($"{errorContext}: {relativeTarget}", e);
+        }
+
         if (!full.StartsWith(NormalizeRootPrefix(root), StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException($"{errorContext}: {relativeTarget}");
         return full;
+    }
+
+    /// <summary>Loest einen relativen Pfad rein textuell gegen den Spielordner auf, ohne zu werfen.
+    /// Fuer Klassifizierungsfragen ("ist das eine Config?", "liegt das unter plugins?"), die eine
+    /// Antwort brauchen und keine Ausnahme.</summary>
+    private static string? TryResolve(GameInstall game, string relPath)
+    {
+        try { return Path.GetFullPath(Path.Combine(game.Root, relPath)); }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Zwei relative Pfade bezeichnen dieselbe Datei im Spielordner. Verglichen wird die
+    /// aufgeloeste Form, nicht die Schreibweise -- "BepInEx\config\X.cfg" und
+    /// "BepInEx\.\config\X.cfg" sind derselbe Eintrag.</summary>
+    private static bool SameRelativePath(GameInstall game, string a, string b)
+    {
+        var (ra, rb) = (TryResolve(game, a), TryResolve(game, b));
+        return ra is not null && rb is not null && IsSamePath(ra, rb);
     }
 
     /// <summary>DIE Enthaltenseins-Pruefung fuer alles, was im Spielordner angefasst wird: erst
@@ -43,7 +76,19 @@ public static class Installer
     private static string ResolveInside(string gameRoot, string relativePath)
     {
         var full = ResolveUnder(gameRoot, relativePath, "path escapes the game folder");
-        RejectReparsedEscape(Path.GetDirectoryName(full)!, gameRoot, "path escapes the game folder");
+
+        // Path.GetDirectoryName liefert null, wenn der aufgeloeste Pfad SELBST eine Wurzel ist.
+        // Bei einem Spielordner, der eine blosse Laufwerkswurzel ist ("X:\" -- genau der Fall, fuer
+        // den es den Trailing-Separator-Fix gibt), laesst die Praefixpruefung oben einen leeren
+        // gespeicherten Pfad durch, und das null wanderte ungeprueft in die Reparse-Pruefung: eine
+        // ArgumentNullException, die den Ueberspringen-Pfad in Remove() nicht abfaengt und den Mod
+        // dauerhaft in state.Mods festnagelte (Fix Round 3, Minor 2). Ein Pfad, der das
+        // Wurzelverzeichnis selbst ist, ist ohnehin nie eine gueltige Datei.
+        var dir = Path.GetDirectoryName(full);
+        if (dir is null)
+            throw new InvalidOperationException($"path is the game folder itself, not a file inside it: '{relativePath}'");
+
+        RejectReparsedEscape(dir, gameRoot, "path escapes the game folder");
         return full;
     }
 
@@ -148,11 +193,21 @@ public static class Installer
     /// PackageMapper.MapEntries nachgemessen) auf ein regulaeres Ziel ab, landete damit in
     /// mod.Files -- und Remove() hat die vom Nutzer eingestellte Config schlicht geloescht, bevor
     /// BackupConfig sie sichern konnte (Fix Round 2, kritisch).</summary>
-    private static bool IsProtectedConfig(string relPath)
+    private static bool IsProtectedConfig(GameInstall game, string relPath)
     {
-        var normalized = relPath.Replace('/', '\\');
-        return normalized.EndsWith(".cfg", StringComparison.OrdinalIgnoreCase)
-               && normalized.StartsWith(@"BepInEx\config\", StringComparison.OrdinalIgnoreCase);
+        if (!relPath.EndsWith(".cfg", StringComparison.OrdinalIgnoreCase)) return false;
+
+        // Entschieden wird an der AUFGELOESTEN Form, nicht an einem Zeichenketten-Praefix: ein
+        // Praefixvergleich behandelt Gross-/Kleinschreibung und '/' zwar richtig, faellt aber bei
+        // einem "."-Segment durch -- "BepInEx\.\config\Dot.cfg" wurde nachweislich GELOESCHT statt
+        // gesichert. Weder Apply noch PackageMapper erzeugen diese Schreibweise, eine
+        // handbearbeitete state.json aber sehr wohl, und der Schutz gilt laut Regel unabhaengig
+        // davon, wie der Eintrag entstanden ist (Fix Round 3, Minor 1). Ein Pfad, den GetFullPath
+        // gar nicht verarbeiten kann, ist hier "nicht geschuetzt" -- er wird aber auch nie
+        // geloescht, weil die Aufloesung im Loeschzweig an derselben Stelle scheitert und der
+        // Eintrag dort uebersprungen wird.
+        var full = TryResolve(game, relPath);
+        return full is not null && IsRootOrUnder(full, game.Config) && !IsSamePath(full, game.Config);
     }
 
     /// <summary>Der Teil eines gespeicherten Pfades unterhalb von "BepInEx\plugins\", oder null,
@@ -161,13 +216,24 @@ public static class Installer
     /// Spielordner mitbringt, haette sonst beim Deaktivieren den ganzen Doorstop-Loader nach
     /// plugins-disabled verschoben und damit still SAEMTLICHE Mods abgeschaltet (Fix Round 2,
     /// Minor 5).</summary>
-    private static string? PluginsRelative(string relPath)
+    private static string? PluginsRelative(GameInstall game, string relPath)
     {
-        const string prefix = @"BepInEx\plugins\";
-        var normalized = relPath.Replace('/', '\\');
-        return normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
-            ? normalized[prefix.Length..]
-            : null;
+        // Aufgeloest verglichen, aus demselben Grund wie bei IsProtectedConfig -- und ohne
+        // Mehraufwand, weil Path.GetRelativePath den Rest unterhalb von plugins gleich mitliefert.
+        var full = TryResolve(game, relPath);
+        if (full is null || !IsRootOrUnder(full, game.Plugins) || IsSamePath(full, game.Plugins))
+            return null;
+        return Path.GetRelativePath(Path.GetFullPath(game.Plugins), full);
+    }
+
+    /// <summary>Der gespiegelte Ort unterhalb von plugins-disabled, oder null, wenn die Datei beim
+    /// Umschalten gar nicht wandert. Eine Datei kann physisch an genau zwei Stellen liegen -- hier
+    /// oder an ihrem kanonischen Ort --, und Remove() muss beide kennen (Fix Round 3, wichtig).</summary>
+    private static string? DisabledMirror(GameInstall game, string relPath)
+    {
+        if (!relPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)) return null;
+        var rel = PluginsRelative(game, relPath);
+        return rel is null ? null : ResolveInside(game.Root, Path.Combine("BepInEx", "plugins-disabled", rel));
     }
 
     /// <summary>Legt das Zielverzeichnis an und merkt sich, welche Ebenen dabei neu entstanden
@@ -471,10 +537,7 @@ public static class Installer
         // Nur .dll-Dateien UNTERHALB VON BepInEx\plugins wandern; alles andere (Configs, TOMLs,
         // und vor allem Dateien direkt im Spielordner wie winhttp.dll) bleibt an seinem
         // kanonischen Ort, auch wenn der Mod gerade deaktiviert ist.
-        var rel = PluginsRelative(file.Path);
-        if (rel is null || !file.Path.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
-            return canonical;
-
+        //
         // Die Unterordnerstruktur wird GESPIEGELT, nicht abgeschnitten: mit
         // Path.GetFileName(file.Path) fielen "BepInEx\plugins\A\Core.dll" und
         // "BepInEx\plugins\B\Core.dll" beide auf dasselbe "plugins-disabled\Core.dll" zusammen --
@@ -483,7 +546,23 @@ public static class Installer
         // PackageMapper laesst beide Ziele aus EINEM Archiv zu, der Fall ist also erreichbar
         // (Fix Round 2, I5). Als reiner Praefixtausch plugins <-> plugins-disabled bleibt das
         // Umschalten dagegen umkehrbar.
-        return ResolveInside(game.Root, Path.Combine("BepInEx", "plugins-disabled", rel));
+        return DisabledMirror(game, file.Path) ?? canonical;
+    }
+
+    /// <summary>Alle Orte, an denen eine Datei physisch liegen kann. Remove() darf sich NICHT auf
+    /// mod.Enabled verlassen, um daraus einen einzigen Ort abzuleiten: seit SetEnabled eine
+    /// geteilte Bibliothek bewusst stehen laesst, wenn ein anderer aktiver Mod sie noch braucht
+    /// (Fix Round 2, I1), koennen Zustand und Wirklichkeit legitim auseinanderfallen -- die Datei
+    /// liegt dann in plugins, waehrend mod.Enabled false ist. Genau diese Kombination liess nach
+    /// "modA deaktivieren, modB entfernen, modA entfernen" eine verwaiste, von niemandem mehr
+    /// verzeichnete DLL zurueck, die BepInEx munter weiterlud (Fix Round 3, wichtig). Geloescht
+    /// wird deshalb, was tatsaechlich da ist -- beide Orte gehoeren derselben Datei, und die
+    /// Referenzzaehlung hat bereits bestaetigt, dass sie niemand mehr braucht.</summary>
+    private static string[] PhysicalCandidates(GameInstall game, ModEntry mod, InstalledFile file)
+    {
+        var enabled = PhysicalPathFor(game, mod, file, true);
+        var disabled = PhysicalPathFor(game, mod, file, false);
+        return enabled.Equals(disabled, StringComparison.OrdinalIgnoreCase) ? [enabled] : [enabled, disabled];
     }
 
     /// <summary>Sichert die aktuelle Zieldatei, falls vorhanden, bevor sie durch
@@ -597,7 +676,18 @@ public static class Installer
         {
             if (!f.Path.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)) continue;
 
-            if (PluginsRelative(f.Path) is null)
+            // Ein Eintrag, der gar nicht im Spielordner liegt, ist Datenmuell oder ein
+            // Manipulationsversuch -- deutlich protokollieren (Warn, nicht Info), aber die
+            // Umschaltung nicht daran scheitern lassen: sonst liesse sich ein Mod wegen eines
+            // einzigen kaputten Eintrags nie wieder an- oder abschalten. Angefasst wird er nicht.
+            var resolved = TryResolve(game, f.Path);
+            if (resolved is null || !IsRootOrUnder(resolved, game.Root))
+            {
+                AppLog.Warn($"toggling {mod.Id}: ignoring file entry '{f.Path}', it does not resolve inside the game folder");
+                continue;
+            }
+
+            if (PluginsRelative(game, f.Path) is null)
             {
                 AppLog.Info($"toggling {mod.Id}: leaving '{f.Path}' where it is, only files under BepInEx\\plugins are moved");
                 continue;
@@ -683,6 +773,10 @@ public static class Installer
     /// <summary>Deinstalliert. Configs werden nie geloescht, nur gesichert (Spec §6.6).</summary>
     public static void Remove(AppState state, GameInstall game, ModEntry mod)
     {
+        // Verzeichnisse, aus denen wirklich etwas verschwunden ist -- am Ende werden die davon
+        // aufgeraeumt, die leer zurueckbleiben (Fix Round 3, kosmetisch).
+        var touchedDirs = new List<string>();
+
         foreach (var f in mod.Files)
         {
             // BepInEx\config\*.cfg wird NIE geloescht, nur verschoben (Spec §6.6) -- und zwar
@@ -691,14 +785,14 @@ public static class Installer
             // voellig regulaeres Ziel ab und landete damit in mod.Files -- diese Schleife hat die
             // vom Nutzer eingestellte Config dann geloescht, und die Sicherung weiter unten fand
             // nichts mehr vor (Fix Round 2, kritisch). Solche Eintraege werden unten gesichert.
-            if (IsProtectedConfig(f.Path)) continue;
+            if (IsProtectedConfig(game, f.Path)) continue;
 
-            // Erst aufloesen, dann erst die Buchfuehrung anfassen: PhysicalPath wirft bei einem
+            // Erst aufloesen, dann erst die Buchfuehrung anfassen: die Aufloesung wirft bei einem
             // Pfad, der den Spielordner verliesse (Pre-Flight-Review Fix Round 1, I4) -- geschaehe
             // das nach ReleaseShared, waere der Anbieter-Eintrag bereits ausgetragen, obwohl der
             // Abbruch verhindert, dass ueberhaupt je etwas geloescht wird.
-            string full;
-            try { full = PhysicalPath(game, mod, f); }
+            string[] candidates;
+            try { candidates = PhysicalCandidates(game, mod, f); }
             catch (InvalidOperationException e)
             {
                 // Protokollieren und ueberspringen statt werfen: ein solcher Eintrag scheitert bei
@@ -712,7 +806,11 @@ public static class Installer
             }
 
             if (!ReleaseShared(state, f.Path, mod.Id)) continue;
-            DeleteIfExists(full, mod.Id);
+            foreach (var candidate in candidates)
+            {
+                DeleteIfExists(candidate, mod.Id);
+                touchedDirs.Add(Path.GetDirectoryName(candidate)!);
+            }
         }
 
         // Ein Mod bringt oft mehr Dateien mit, als sein eigener Files-Eintrag zeigt: die
@@ -730,17 +828,21 @@ public static class Installer
             // Auch hier gilt der Config-Vorrang: eine geteilte Config wird verschoben, nie
             // geloescht. ReleaseShared hat oben bereits 'true' geliefert, dieser Mod war also der
             // letzte Anbieter -- niemand sonst verliert dadurch seine Einstellungen.
-            if (IsProtectedConfig(path)) { BackupConfigFile(game, path, mod.Id); continue; }
+            if (IsProtectedConfig(game, path)) { BackupConfigFile(game, path, mod.Id); continue; }
 
-            string full;
+            string[] candidates;
             try
             {
-                // Geteilte Dateien werden von SetEnabled nie zwischen plugins und plugins-disabled
-                // verschoben (nur mod.Files ist davon betroffen) -- ihr kanonischer Ort ist deshalb
-                // auch ihr tatsaechlicher, PhysicalPath ist hier nicht noetig. Die Enthaltenseins-
-                // Pruefung bleibt trotzdem Pflicht: 'path' stammt aus state.json (Pre-Flight-Review
-                // Fix Round 1, I4).
-                full = ResolveInside(game.Root, path);
+                // Auch eine geteilte Datei kann an zwei Stellen liegen: SetEnabled verschiebt sie
+                // zwar nur, wenn kein anderer aktiver Mod sie mehr braucht -- aber dann eben doch.
+                // Beide Orte pruefen, sonst bleibt die Datei nach dem Entfernen des letzten
+                // Anbieters unverzeichnet liegen (Fix Round 3, wichtig). Die Enthaltenseins-
+                // Pruefung bleibt Pflicht: 'path' stammt aus state.json (Fix Round 1, I4).
+                var canonical = ResolveInside(game.Root, path);
+                var mirror = DisabledMirror(game, path);
+                candidates = mirror is null || mirror.Equals(canonical, StringComparison.OrdinalIgnoreCase)
+                    ? [canonical]
+                    : [canonical, mirror];
             }
             catch (InvalidOperationException e)
             {
@@ -755,7 +857,11 @@ public static class Installer
 
             try
             {
-                DeleteIfExists(full, mod.Id);
+                foreach (var candidate in candidates)
+                {
+                    DeleteIfExists(candidate, mod.Id);
+                    touchedDirs.Add(Path.GetDirectoryName(candidate)!);
+                }
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
@@ -774,22 +880,33 @@ public static class Installer
         }
 
         // Configs, die der Mod selbst mitgebracht hat: verschieben statt loeschen.
-        foreach (var f in mod.Files.Where(f => IsProtectedConfig(f.Path)))
-        {
-            // Eine GETEILTE Config gehoert der SharedFiles-Schleife oben -- nur die kennt die
-            // Referenzzaehlung. Steht der Pfad dort noch, ist dieser Mod nicht der letzte
-            // Anbieter gewesen: die Datei wegzuverschieben wuerde einem anderen, noch
-            // installierten Mod seine Einstellungen unter den Fuessen wegziehen.
-            if (state.SharedFiles.Any(s => s.Path.Equals(f.Path, StringComparison.OrdinalIgnoreCase))) continue;
-            BackupConfigFile(game, f.Path, mod.Id);
-        }
+        foreach (var f in mod.Files.Where(f => IsProtectedConfig(game, f.Path)))
+            BackupConfigIfUnshared(state, game, f.Path, mod.Id);
 
         // Und zusaetzlich die nach der Mod-Id benannte Config: die legt BepInEx erst zur Laufzeit
         // an, sie steht in keinem Archiv und taucht deshalb in keinem mod.Files-Eintrag auf.
         // Wurde sie oben schon verschoben, findet dieser Aufruf nichts mehr vor und tut nichts.
-        BackupConfig(game, mod.Id);
+        BackupConfig(state, game, mod.Id);
+
+        PruneEmptyToggleDirs(game, touchedDirs);
         state.Mods.Remove(mod);
         AppLog.Info($"removed {mod.Id}");
+    }
+
+    /// <summary>Sichert eine Config nur dann, wenn sie NICHT mehr in der Referenzzaehlung steht.
+    /// Steht ihr Pfad noch in state.SharedFiles, war dieser Mod nicht der letzte Anbieter: sie
+    /// wegzuverschieben naehme einem anderen, weiterhin installierten Mod seine Einstellungen --
+    /// verloren waere nichts (verschoben ist nicht geloescht), aber der andere Mod stuende ohne
+    /// seine Konfiguration da. Die Entscheidung gehoert damit an dieselbe Referenzzaehlung wie
+    /// jede andere geteilte Datei (Fix Round 3, Minor 3).</summary>
+    private static void BackupConfigIfUnshared(AppState state, GameInstall game, string relPath, string modId)
+    {
+        if (state.SharedFiles.Any(s => SameRelativePath(game, s.Path, relPath)))
+        {
+            AppLog.Info($"leaving config '{relPath}' in place while removing {modId}: another mod still provides it");
+            return;
+        }
+        BackupConfigFile(game, relPath, modId);
     }
 
     private static void DeleteIfExists(string full, string modId)
@@ -802,7 +919,7 @@ public static class Installer
         }
     }
 
-    private static void BackupConfig(GameInstall game, string modId)
+    private static void BackupConfig(AppState state, GameInstall game, string modId)
     {
         // modId kommt ungefiltert aus [BepInPlugin] einer Fremd-DLL (ModInspector) und wird dort
         // nirgends validiert -- effektiv angreifer-kontrollierter Text. Ohne Saeuberung wuerde
@@ -810,7 +927,10 @@ public static class Installer
         // vorgesehenen Ordner hinauszeigt (Pre-Flight-Review Fix Round 1, I4). ModInspector selbst
         // bleibt unveraendert -- die GUID bleibt die Identitaet des Mods, sie darf nur nie
         // ungefiltert Teil eines Pfads werden.
-        BackupConfigFile(game, Path.Combine("BepInEx", "config", SanitizeForFileName(modId) + ".cfg"), modId);
+        // Auch dieser Weg muss die Referenzzaehlung achten: die nach der Mod-Id benannte Config
+        // kann genauso von mehreren Mods gefuehrt werden wie jede andere Datei.
+        BackupConfigIfUnshared(state, game,
+            Path.Combine("BepInEx", "config", SanitizeForFileName(modId) + ".cfg"), modId);
     }
 
     /// <summary>Verschiebt EINE Konfigurationsdatei in den Sicherungsordner. Nie loeschen, immer

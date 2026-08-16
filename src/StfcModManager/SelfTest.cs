@@ -508,6 +508,35 @@ internal static class SelfTest
         Check(!Directory.Exists(Path.Combine(lockRoot, @"BepInEx\plugins-disabled")),
               "SetEnabled: a library another enabled mod still provides is not moved out from under it");
 
+        // --- Installer, Fix Round 3: eine geteilte Config wird nicht weggesichert, solange ein
+        // anderer Mod sie noch anbietet -- auch nicht ueber den id-abgeleiteten Weg am Ende von
+        // Remove(), der die Referenzzaehlung frueher umging ---
+        var scGame = new GameInstall(Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-nonexistent-{Guid.NewGuid():N}"));
+        var scState = new AppState();
+        var scFoo = new ModEntry { Id = "Foo", Name = "Foo", Version = "1.0" };
+        scState.Mods.Add(scFoo);
+        scState.Mods.Add(new ModEntry { Id = "Bar", Name = "Bar", Version = "1.0" });
+        Installer.RegisterShared(scState, @"BepInEx\config\Foo.cfg", "c", "1.0", "Foo");
+        Installer.RegisterShared(scState, @"BepInEx\config\Foo.cfg", "c", "1.0", "Bar");
+
+        Installer.Remove(scState, scGame, scFoo);
+        Eq(scState.SharedFiles.Count, 1, "remove: a shared config's record survives while another mod provides it");
+        Eq(scState.SharedFiles.Count == 1 ? scState.SharedFiles[0].Providers.Single() : null, "Bar",
+           "remove: only the leaving mod's provider entry was released from the shared config");
+
+        // --- Installer, Fix Round 3: ein Config-Pfad mit "."-Segment wird als Config erkannt ---
+        // Die Zugehoerigkeit entscheidet sich an der aufgeloesten Form, nicht an einem Praefix --
+        // sonst faellt genau diese Schreibweise durch den Schutz und wird geloescht statt gesichert.
+        var dotState = new AppState();
+        var dotMod = new ModEntry
+        {
+            Id = "dotmod", Name = "Dot", Version = "1.0",
+            Files = { new InstalledFile { Path = @"BepInEx\.\config\Dot.cfg", Sha256 = "c" } }
+        };
+        dotState.Mods.Add(dotMod);
+        Installer.Remove(dotState, scGame, dotMod);
+        Eq(dotState.Mods.Count, 0, "remove: a config path spelled with a '.' segment does not break the uninstall");
+
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
     }
