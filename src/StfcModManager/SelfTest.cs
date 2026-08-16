@@ -562,7 +562,328 @@ internal static class SelfTest
         Eq(ownState.Mods.Count == 1 ? ownState.Mods[0].Id : null, "ownB",
            "remove: the mod owning the plugins-disabled path is the one still there");
 
+        FileSystemChecks();
+
         Console.WriteLine($"{_passed} passed, {_failed} failed");
         return _failed == 0 ? 0 : 1;
+    }
+
+    // ===================================================================================
+    // Dateisystem-gestuetzte Pruefungen fuer den Installer -- den einzigen Teil der App, der
+    // den Spielordner des Nutzers veraendert.
+    //
+    // Die reinen Buchfuehrungs-Asserts weiter oben erreichen die Loesch-, Verschiebe- und
+    // Rollback-Zweige NIE: jeder Spielordner dort ist bewusst ein nicht existierender Pfad,
+    // File.Exists() liefert ueberall false, und der interessante Code laeuft gar nicht erst an.
+    // Rund zwanzig Befunde aus fuenf Ueberarbeitungsrunden wurden ausschliesslich von
+    // Wegwerf-Testprogrammen gefunden, die es allesamt nicht mehr gibt -- ohne die folgenden
+    // Pruefungen wuerde ihre Rueckkehr von nichts bemerkt. Deshalb hier: ein echter
+    // Wegwerf-Spielordner unter Path.GetTempPath(), der echte Code darauf, und im finally alles
+    // wieder weg (einschliesslich der Sicherungen, die der Installer in %LOCALAPPDATA% anlegt).
+    // ===================================================================================
+    private static void FileSystemChecks()
+    {
+        string root;
+        try
+        {
+            root = Path.Combine(Path.GetTempPath(), $"stfcmm-selftest-fs-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(root);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            // Umgebung ohne beschreibbares Temp-Verzeichnis: der Rest der Suite laeuft weiter,
+            // statt hier mit einer ungefangenen Ausnahme abzubrechen.
+            Console.WriteLine("filesystem checks skipped: no writable temp directory");
+            return;
+        }
+
+        var backupsBefore = Entries(AppPaths.BackupDir);
+        var configBackupsBefore = Entries(AppPaths.ConfigBackupDir);
+        var backupDirExisted = Directory.Exists(AppPaths.BackupDir);
+        var configBackupDirExisted = Directory.Exists(AppPaths.ConfigBackupDir);
+
+        try
+        {
+            Guarded("config is moved, never deleted", () => CheckConfigIsMovedNeverDeleted(root));
+            Guarded("Remove respects plugins-disabled ownership", () => CheckRemoveRespectsDisabledPathOwnership(root));
+            Guarded("a shared library survives a toggle", () => CheckSharedLibrarySurvivesToggle(root));
+            Guarded("a nested plugin round-trips", () => CheckNestedPluginRoundTrip(root));
+            Guarded("Apply rejects duplicates and rolls back", () => CheckApplyRejectsDuplicatesAndRollsBack(root));
+            Guarded("escaping paths are refused", () => CheckEscapingPathsAreRefused(root));
+        }
+        finally
+        {
+            TryDelete(root);
+            DeleteNewEntries(AppPaths.BackupDir, backupsBefore);
+            DeleteNewEntries(AppPaths.ConfigBackupDir, configBackupsBefore);
+
+            // Auch die Ordner selbst wieder abraeumen, falls erst dieser Lauf sie angelegt hat --
+            // ein Selbsttest soll in %LOCALAPPDATA% nichts zuruecklassen, auch nichts Leeres.
+            if (!backupDirExisted) TryDelete(AppPaths.BackupDir);
+            if (!configBackupDirExisted) TryDelete(AppPaths.ConfigBackupDir);
+        }
+    }
+
+    /// <summary>Fuehrt eine Dateisystem-Pruefung aus und verwandelt eine unerwartete Ausnahme in
+    /// einen normalen Fehlschlag. Ohne das reisst ein Regress, der WIRFT statt falsch zu antworten,
+    /// den kompletten Selbsttest ab -- ohne Zusammenfassung, ohne Hinweis, welche Pruefung es war
+    /// (beim Gegentest gegen aeltere Installer-Staende genau so passiert). Bewusst ungefiltert:
+    /// jede Ausnahme aus dem Installer ist hier ein Befund, kein Betriebsunfall.</summary>
+    private static void Guarded(string what, Action check)
+    {
+        try { check(); }
+        catch (Exception e)
+        {
+            Check(false, $"fs: {what} — threw {e.GetType().Name} instead of completing: {e.Message}");
+        }
+    }
+
+    private static string[] Entries(string dir)
+    {
+        try { return Directory.Exists(dir) ? Directory.GetFileSystemEntries(dir) : []; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return []; }
+    }
+
+    /// <summary>Entfernt genau das, was dieser Lauf in einem der Anwendungsordner erzeugt hat --
+    /// alles Aeltere gehoert dem Nutzer und bleibt unangetastet.</summary>
+    private static void DeleteNewEntries(string dir, string[] before)
+    {
+        foreach (var entry in Entries(dir).Except(before, StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                if (Directory.Exists(entry)) Directory.Delete(entry, recursive: true);
+                else File.Delete(entry);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    private static void TryDelete(string dir)
+    {
+        try { Directory.Delete(dir, recursive: true); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
+
+    private static string Put(string path, string content)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, content);
+        return path;
+    }
+
+    private static Exception? Threw(Action action)
+    {
+        try { action(); return null; }
+        catch (Exception e) { return e; }
+    }
+
+    /// <summary>Eine Config unterhalb von BepInEx\config wird verschoben, nie geloescht -- auch
+    /// dann, wenn sie (weil das Archiv sie mitgebracht hat) in mod.Files steht, und auch in der
+    /// Schreibweise mit "."-Segment.</summary>
+    private static void CheckConfigIsMovedNeverDeleted(string root)
+    {
+        var gameRoot = Path.Combine(root, "cfg");
+        var dll = Put(Path.Combine(gameRoot, @"BepInEx\plugins\Cfg.dll"), "PLUGIN");
+        var cfg = Put(Path.Combine(gameRoot, @"BepInEx\config\CfgMod.cfg"), "USER_TUNED");
+        var before = Entries(AppPaths.ConfigBackupDir);
+
+        var state = new AppState();
+        var mod = new ModEntry
+        {
+            Id = "CfgMod", Name = "Cfg", Version = "1.0",
+            Files =
+            {
+                new InstalledFile { Path = @"BepInEx\plugins\Cfg.dll", Sha256 = "d" },
+                new InstalledFile { Path = @"BepInEx\.\config\CfgMod.cfg", Sha256 = "c" }
+            }
+        };
+        state.Mods.Add(mod);
+        Installer.Remove(state, new GameInstall(gameRoot), mod);
+
+        Check(!File.Exists(dll), "fs: Remove deletes the mod's plugin dll");
+        Check(!File.Exists(cfg), "fs: Remove moves the bundled config out of BepInEx\\config");
+
+        var added = Entries(AppPaths.ConfigBackupDir).Except(before, StringComparer.OrdinalIgnoreCase).ToArray();
+        Eq(added.Length, 1, "fs: exactly one config backup was written");
+        Check(added.Length == 1 && File.ReadAllText(added[0]) == "USER_TUNED",
+              "fs: the config backup holds the user's settings -- a config is never destroyed");
+    }
+
+    /// <summary>Der plugins-disabled-Ort ist ein eigenstaendig installierbares Ziel, kein
+    /// Zweitname: er darf nur abgeraeumt werden, wenn ihn niemand sonst besitzt.</summary>
+    private static void CheckRemoveRespectsDisabledPathOwnership(string root)
+    {
+        var gameRoot = Path.Combine(root, "own");
+        var game = new GameInstall(gameRoot);
+        var aFile = Put(Path.Combine(gameRoot, @"BepInEx\plugins\Core.dll"), "A_CONTENT");
+        var bFile = Put(Path.Combine(gameRoot, @"BepInEx\plugins-disabled\Core.dll"), "B_CONTENT");
+
+        var state = new AppState();
+        var modA = new ModEntry
+        {
+            Id = "ownA", Name = "A", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\Core.dll", Sha256 = "a" } }
+        };
+        var modB = new ModEntry
+        {
+            Id = "ownB", Name = "B", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins-disabled\Core.dll", Sha256 = "b" } }
+        };
+        state.Mods.Add(modA);
+        state.Mods.Add(modB);
+
+        Installer.Remove(state, game, modA);
+        Check(!File.Exists(aFile), "fs: Remove deletes the file the removed mod owns");
+        Check(File.Exists(bFile) && File.ReadAllText(bFile) == "B_CONTENT",
+              "fs: Remove leaves a plugins-disabled file another installed mod owns untouched");
+
+        Installer.Remove(state, game, modB);
+        Check(!File.Exists(bFile), "fs: Remove does delete that same file once its own owner goes");
+
+        // Die Kehrseite derselben Regel, und ein eigener Codepfad: hier ist der plugins-disabled-Ort
+        // NICHT der kanonische Pfad des Mods, sondern nur die abgeleitete Ablage eines deaktivierten
+        // Mods. Besitzt ihn niemand sonst, MUSS er mitgehen -- sonst bleibt eine Datei liegen, die
+        // BepInEx weiter laedt, waehrend die Buchfuehrung den Mod fuer entfernt haelt.
+        var parked = Put(Path.Combine(gameRoot, @"BepInEx\plugins-disabled\Parked.dll"), "PARKED");
+        var parkedState = new AppState();
+        var parkedMod = new ModEntry
+        {
+            Id = "parked", Name = "P", Version = "1.0", Enabled = false,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\Parked.dll", Sha256 = "p" } }
+        };
+        parkedState.Mods.Add(parkedMod);
+
+        Installer.Remove(parkedState, game, parkedMod);
+        Check(!File.Exists(parked),
+              "fs: Remove deletes a disabled mod's parked file at its derived location when nobody else owns it");
+    }
+
+    /// <summary>Eine geteilte Bibliothek darf nicht unter einem anderen, noch aktivierten Mod
+    /// weggeschoben werden.</summary>
+    private static void CheckSharedLibrarySurvivesToggle(string root)
+    {
+        var gameRoot = Path.Combine(root, "shared");
+        var game = new GameInstall(gameRoot);
+        var json = Put(Path.Combine(gameRoot, @"BepInEx\plugins\Json.dll"), "JSON_LIB");
+        var ownA = Put(Path.Combine(gameRoot, @"BepInEx\plugins\OwnA.dll"), "A");
+
+        var state = new AppState();
+        var modA = new ModEntry
+        {
+            Id = "shA", Name = "A", Version = "1.0", Enabled = true,
+            Files =
+            {
+                new InstalledFile { Path = @"BepInEx\plugins\OwnA.dll", Sha256 = "a" },
+                new InstalledFile { Path = @"BepInEx\plugins\Json.dll", Sha256 = "j" }
+            }
+        };
+        var modB = new ModEntry
+        {
+            Id = "shB", Name = "B", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\Json.dll", Sha256 = "j" } }
+        };
+        state.Mods.Add(modA);
+        state.Mods.Add(modB);
+        Installer.RegisterShared(state, @"BepInEx\plugins\Json.dll", "j", "13.0.3", "shA");
+        Installer.RegisterShared(state, @"BepInEx\plugins\Json.dll", "j", "13.0.3", "shB");
+
+        Installer.SetEnabled(state, game, modA, false);
+        Check(!File.Exists(ownA), "fs: SetEnabled moves the mod's own dll out of plugins");
+        Check(File.Exists(json),
+              "fs: SetEnabled leaves a library another ENABLED mod provides where it is");
+
+        Installer.SetEnabled(state, game, modB, false);
+        Check(!File.Exists(json), "fs: once no enabled provider remains, the shared library moves too");
+    }
+
+    /// <summary>Ein Plugin in einem Unterordner kehrt an genau seinen kanonischen Ort zurueck --
+    /// und wird beim naechsten Deaktivieren dort auch wiedergefunden.</summary>
+    private static void CheckNestedPluginRoundTrip(string root)
+    {
+        var gameRoot = Path.Combine(root, "nested");
+        var game = new GameInstall(gameRoot);
+        var canonical = Put(Path.Combine(gameRoot, @"BepInEx\plugins\MyMod\Core.dll"), "NESTED_CONTENT");
+
+        var state = new AppState();
+        var mod = new ModEntry
+        {
+            Id = "nested", Name = "N", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = @"BepInEx\plugins\MyMod\Core.dll", Sha256 = "n" } }
+        };
+        state.Mods.Add(mod);
+
+        Installer.SetEnabled(state, game, mod, false);
+        Check(File.Exists(Path.Combine(gameRoot, @"BepInEx\plugins-disabled\MyMod\Core.dll")),
+              "fs: disabling mirrors the plugin's subfolder under plugins-disabled");
+
+        Installer.SetEnabled(state, game, mod, true);
+        Check(File.Exists(canonical) && File.ReadAllText(canonical) == "NESTED_CONTENT",
+              "fs: enabling returns the plugin to its canonical nested path with its content intact");
+
+        Installer.SetEnabled(state, game, mod, false);
+        Check(!File.Exists(canonical), "fs: a second disable still finds the file at its derived location");
+    }
+
+    /// <summary>Apply liefert nie halb: doppelte Ziele werden vorab abgelehnt, und ein spaeter
+    /// scheiternder Schritt macht alles Vorherige rueckgaengig.</summary>
+    private static void CheckApplyRejectsDuplicatesAndRollsBack(string root)
+    {
+        var gameRoot = Path.Combine(root, "apply");
+        var srcA = Put(Path.Combine(root, "src", "a.dll"), "A");
+        var srcB = Put(Path.Combine(root, "src", "b.dll"), "B");
+
+        var duplicate = Threw(() => Installer.Apply(gameRoot, new (string, string)[]
+        {
+            (srcA, @"BepInEx\plugins\Dup.dll"),
+            (srcB, "BepInEx/plugins/Dup.dll")
+        }));
+        Check(duplicate is ArgumentException, "fs: Apply rejects two ops writing the same target");
+        Check(!File.Exists(Path.Combine(gameRoot, @"BepInEx\plugins\Dup.dll")),
+              "fs: the rejected op list wrote nothing at all");
+
+        var existing = Put(Path.Combine(gameRoot, "Existing.dll"), "ORIGINAL");
+        var missing = Path.Combine(root, "src", $"absent-{Guid.NewGuid():N}.dll");
+        var rolledBack = Threw(() => Installer.Apply(gameRoot, new (string, string)[]
+        {
+            (srcA, "Existing.dll"),
+            (missing, @"BepInEx\plugins\New.dll")
+        }));
+        Check(rolledBack is not null, "fs: Apply throws when a later op cannot be carried out");
+        Check(File.ReadAllText(existing) == "ORIGINAL",
+              "fs: rollback restored the overwritten file to its original content");
+        Check(!File.Exists(Path.Combine(gameRoot, @"BepInEx\plugins\New.dll")),
+              "fs: rollback removed the file that had just been written");
+    }
+
+    /// <summary>Ein Pfad, der den Spielordner verlaesst, wird von Apply, SetEnabled und Remove
+    /// gleichermassen verweigert -- keiner von ihnen fasst die Datei draussen an.</summary>
+    private static void CheckEscapingPathsAreRefused(string root)
+    {
+        var gameRoot = Path.Combine(root, "escape");
+        Directory.CreateDirectory(gameRoot);
+        var game = new GameInstall(gameRoot);
+        var victim = Put(Path.Combine(root, "outside-victim.dll"), "OUTSIDE");
+        var escaping = Path.GetRelativePath(gameRoot, victim); // "..\outside-victim.dll"
+        var src = Put(Path.Combine(root, "src", "escape-src.dll"), "NEW");
+
+        Check(Threw(() => Installer.Apply(gameRoot, new (string, string)[] { (src, escaping) })) is not null,
+              "fs: Apply refuses a target that escapes the game folder");
+
+        var state = new AppState();
+        var mod = new ModEntry
+        {
+            Id = "escaper", Name = "E", Version = "1.0", Enabled = true,
+            Files = { new InstalledFile { Path = escaping, Sha256 = "e" } }
+        };
+        state.Mods.Add(mod);
+
+        Threw(() => Installer.SetEnabled(state, game, mod, false));
+        Check(File.Exists(victim), "fs: SetEnabled never moves a file that lies outside the game folder");
+
+        Installer.Remove(state, game, mod);
+        Check(File.Exists(victim) && File.ReadAllText(victim) == "OUTSIDE",
+              "fs: Remove never deletes a file that lies outside the game folder");
+        Eq(state.Mods.Count, 0, "fs: Remove still completes despite the unusable entry");
     }
 }

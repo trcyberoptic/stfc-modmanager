@@ -600,30 +600,68 @@ public static class Installer
     /// mitzuloeschen hat nachweislich fremde, noch installierte Dateien zerstoert
     /// (Fix Round 4, wichtig). Geprueft werden beide Ableitungen jedes fremden Eintrags, nicht nur
     /// dessen kanonischer Pfad: ein deaktivierter Mod belegt physisch seinen Ausweichort.</summary>
-    private static bool IsOwnedByAnother(AppState state, GameInstall game, ModEntry removing, string fullPath)
+    ///
+    /// Der Index wird EINMAL pro Remove()-Durchlauf gebaut statt pro Anfrage neu durchsucht: jede
+    /// Sondierung kostet ein Path.GetFullPath plus einen Verknuepfungs-Aufstieg bis zur
+    /// Spielordner-Wurzel, also Systemaufrufe, keine Rechenzeit. Gemessen beim Entfernen eines
+    /// deaktivierten Mods mit der Suche pro Anfrage: 21 ms bei 30 Eintraegen, 63 ms bei 100,
+    /// 1513 ms bei 400, 8757 ms bei 1200 (Fix Round 5, Minor).
+    private sealed class OwnershipIndex
     {
-        foreach (var other in state.Mods)
+        private readonly HashSet<string> _modOwned = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, List<string>> _sharedOwned = new(StringComparer.OrdinalIgnoreCase);
+
+        // Derselbe Vergleichsbegriff wie IsSamePath, nur als Schluessel statt als Vergleich.
+        private static string Key(string full) => Path.TrimEndingDirectorySeparator(full);
+
+        internal static OwnershipIndex Build(AppState state, GameInstall game, ModEntry removing)
         {
-            if (ReferenceEquals(other, removing)) continue; // der Mod, der ohnehin gerade geht
-            foreach (var f in other.Files)
-                foreach (var enabled in new[] { true, false })
+            var index = new OwnershipIndex();
+
+            // state.Mods wird waehrend Remove() nicht veraendert (der Mod verschwindet erst ganz am
+            // Ende), diese Haelfte ist also fuer den gesamten Durchlauf gueltig.
+            foreach (var other in state.Mods)
+            {
+                if (ReferenceEquals(other, removing)) continue; // der Mod, der ohnehin gerade geht
+                foreach (var f in other.Files)
+                    foreach (var enabled in new[] { true, false })
+                    {
+                        string derived;
+                        try { derived = PhysicalPathFor(game, other, f, enabled); }
+                        catch (InvalidOperationException) { continue; }
+                        index._modOwned.Add(Key(derived));
+                    }
+            }
+
+            // state.SharedFiles SCHRUMPFT dagegen waehrend Remove() (ReleaseShared traegt Anbieter
+            // aus). Deshalb wird hier nur die teure Aufloesung vorberechnet -- Ort -> die
+            // SharedFiles-Pfade, die dorthin zeigen --, waehrend die Frage "gibt es den Eintrag
+            // JETZT noch?" bei jeder Anfrage frisch beantwortet wird. Damit bleibt die Semantik
+            // exakt die der frueheren Direktsuche: ein bereits freigegebener Eintrag besitzt nichts
+            // mehr.
+            foreach (var shared in state.SharedFiles)
+                foreach (var location in new[] { TryResolve(game, shared.Path), TryDisabledMirror(game, shared.Path) })
                 {
-                    string derived;
-                    try { derived = PhysicalPathFor(game, other, f, enabled); }
-                    catch (InvalidOperationException) { continue; }
-                    if (IsSamePath(derived, fullPath)) return true;
+                    if (location is null) continue;
+                    var key = Key(location);
+                    if (!index._sharedOwned.TryGetValue(key, out var paths))
+                        index._sharedOwned[key] = paths = [];
+                    if (!paths.Contains(shared.Path, StringComparer.OrdinalIgnoreCase))
+                        paths.Add(shared.Path);
                 }
+
+            return index;
         }
 
-        foreach (var shared in state.SharedFiles)
+        internal bool IsOwnedByAnother(AppState state, string fullPath)
         {
-            var canonical = TryResolve(game, shared.Path);
-            if (canonical is not null && IsSamePath(canonical, fullPath)) return true;
-            var mirror = TryDisabledMirror(game, shared.Path);
-            if (mirror is not null && IsSamePath(mirror, fullPath)) return true;
-        }
+            var key = Key(fullPath);
+            if (_modOwned.Contains(key)) return true;
+            if (!_sharedOwned.TryGetValue(key, out var paths)) return false;
 
-        return false;
+            // Reiner Zeichenkettenvergleich, keine Systemaufrufe -- die teure Arbeit ist erledigt.
+            return paths.Any(p => state.SharedFiles.Any(s => s.Path.Equals(p, StringComparison.OrdinalIgnoreCase)));
+        }
     }
 
     /// <summary>Raeumt den Ausweichort einer freigegebenen Datei ab -- aber nur, wenn ihn wirklich
@@ -631,11 +669,13 @@ public static class Installer
     /// liegengebliebenes version.dll_ kann einen anderen Community-Patch-Build enthalten (genau
     /// dafuer gibt es BackupBeforeOverwrite), deshalb wird vor dem Loeschen gesichert.</summary>
     private static void DeleteAlternateIfUnowned(
-        AppState state, GameInstall game, ModEntry mod, string alternate, List<string> touchedDirs)
+        Func<OwnershipIndex> owned, AppState state, ModEntry mod, string alternate, List<string> touchedDirs)
     {
+        // Die Existenzpruefung steht bewusst VOR dem Index: der Normalfall (kein Ausweichort auf
+        // der Platte) kommt so ganz ohne den Aufbau des Index aus.
         if (!File.Exists(alternate)) return;
 
-        if (IsOwnedByAnother(state, game, mod, alternate))
+        if (owned().IsOwnedByAnother(state, alternate))
         {
             AppLog.Info($"leaving '{alternate}' in place while removing {mod.Id}: another installed mod owns that location");
             return;
@@ -858,6 +898,11 @@ public static class Installer
         // aufgeraeumt, die leer zurueckbleiben (Fix Round 3, kosmetisch).
         var touchedDirs = new List<string>();
 
+        // Erst bei Bedarf aufgebaut: die allermeisten Deinstallationen haben gar keinen
+        // Ausweichort auf der Platte und zahlen den Aufbau deshalb nie.
+        OwnershipIndex? ownershipIndex = null;
+        OwnershipIndex Owned() => ownershipIndex ??= OwnershipIndex.Build(state, game, mod);
+
         foreach (var f in mod.Files)
         {
             // BepInEx\config\*.cfg wird NIE geloescht, nur verschoben (Spec §6.6) -- und zwar
@@ -894,7 +939,7 @@ public static class Installer
             // Der Ausweichort gehoert NICHT automatisch mit dazu -- er ist ein eigenstaendiges
             // Ziel, das ein anderer Mod besitzen kann (s. IsOwnedByAnother).
             if (candidates.Alternate is { } alternate)
-                DeleteAlternateIfUnowned(state, game, mod, alternate, touchedDirs);
+                DeleteAlternateIfUnowned(Owned, state, mod, alternate, touchedDirs);
         }
 
         // Ein Mod bringt oft mehr Dateien mit, als sein eigener Files-Eintrag zeigt: die
@@ -948,7 +993,7 @@ public static class Installer
                 touchedDirs.Add(Path.GetDirectoryName(canonicalShared)!);
 
                 if (sharedMirror is not null)
-                    DeleteAlternateIfUnowned(state, game, mod, sharedMirror, touchedDirs);
+                    DeleteAlternateIfUnowned(Owned, state, mod, sharedMirror, touchedDirs);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
