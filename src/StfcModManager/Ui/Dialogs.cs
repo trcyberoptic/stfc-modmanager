@@ -72,6 +72,26 @@ public static class Dialogs
         _ => $"{bytes} bytes"
     };
 
+    /// <summary>Fix-Runde 2, Punkt 3 (C1 lebte noch auf dem Install-Pfad): PackageMapper lehnt
+    /// "plugins-disabled" als Ordnername in einem Archiveintrag nicht ab -- ein Eintrag wie
+    /// "MyMod/BepInEx/plugins-disabled/FakeA.dll" bildet klaglos auf das Ziel
+    /// "BepInEx\plugins-disabled\FakeA.dll" ab. Ohne diese Kanonisierung haette ApplyPackage GENAU
+    /// dorthin geschrieben UND genau diesen Pfad als den (angeblich aktivierten) Ort gespeichert --
+    /// exakt das Symptom, das der urspruengliche C1-Fund fuer die Adoption beschrieb: der
+    /// gespeicherte Pfad liegt nicht mehr unter BepInEx\plugins, SetEnabled erkennt ihn nie als
+    /// umschaltbar. Schreibt (statt nur beim Speichern umzubenennen) tatsaechlich an den kanonischen
+    /// Ort um, damit geschriebene Datei und gespeicherter Pfad uebereinstimmen -- ein frischer
+    /// Install gilt als aktiviert, jetzt auch fuer diesen Ort zutreffend. Alles ausserhalb von
+    /// BepInEx\plugins(-disabled)\ (version.dll, Configs, Patcher, ...) geht unveraendert durch.
+    /// Rein und ohne I/O testbar.</summary>
+    internal static string CanonicalizePluginTarget(string target)
+    {
+        var disabledPrefix = Path.Combine("BepInEx", "plugins-disabled") + Path.DirectorySeparatorChar;
+        return target.StartsWith(disabledPrefix, StringComparison.OrdinalIgnoreCase)
+            ? Path.Combine("BepInEx", "plugins", target[disabledPrefix.Length..])
+            : target;
+    }
+
     /// <summary>Zeigt eine InstallRollbackException verstaendlich an: welche Dateien betroffen sind
     /// und wo die Sicherung liegt, statt eines Stacktraces oder eines Achselzuckens. ex.Message ist
     /// hier Installer-eigener, englischer Text (s. InstallRollbackException in Installer.cs), also
@@ -287,6 +307,17 @@ public static class Dialogs
             else
             {
                 ops.Add((packagePath, map.Files[0].Target));
+            }
+
+            // Fix-Runde 2, Punkt 3 (C1 lebte noch auf dem Install-Pfad, s. CanonicalizePluginTarget-
+            // Kommentar): VOR der Identitaets-/Enabled-Bestimmung umschreiben, damit "mainDll" weiter
+            // unten (aus "ops" ausgewaehlt) und "installed[i].Path" (von Installer.Apply aus
+            // "ops" abgeleitet) beide bereits die kanonische Form tragen -- geschriebene Datei und
+            // gespeicherter Pfad laufen so nie auseinander.
+            for (var i = 0; i < ops.Count; i++)
+            {
+                var canonicalTarget = CanonicalizePluginTarget(ops[i].Target);
+                if (canonicalTarget != ops[i].Target) ops[i] = (ops[i].Source, canonicalTarget);
             }
 
             // Identitaet aus der ersten DLL mit BepInPlugin-Attribut.

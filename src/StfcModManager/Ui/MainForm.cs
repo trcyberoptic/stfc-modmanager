@@ -47,6 +47,19 @@ public sealed class MainForm : Form
     // selbst ist aber ein oeffentlicher Core-Record und laesst sich von hier aus genauso bauen.
     private List<Finding> _reconcileFindings = [];
 
+    // Fix-Runde 2, Punkt 1 (wichtig) -- Guard()'s RefreshUi() spiegelt nur den Zustand GENAU JETZT,
+    // im Moment des Blocks; danach pollt niemand mehr nach. Verifiziert per A/B gegen den Vor-Fix-
+    // Stand: dort blieben alle Knoepfe ununterbrochen bedienbar (kein Timer, kein Activated-Handler
+    // existierte), waehrend die Fix-Runde-1-Fassung sechs von neun Knoepfen -- einschliesslich
+    // "Rescan", dem naheliegendsten manuellen Ausweg -- dauerhaft deaktiviert liess, auch drei
+    // Sekunden und ein programmatisches Minimieren/Wiederherstellen spaeter. Dieser Timer ist der
+    // fehlende Nachpoll-Mechanismus: er laeuft unabhaengig von Fensteraktivierung (Activated allein
+    // reicht nicht -- ein Nutzer, der einfach nur wartet, ohne das Fenster zu wechseln, bekaeme sonst
+    // nie ein Update) und behebt in derselben Bewegung die spiegelbildliche Staleness der Kopfzeile
+    // (die vorher faelschlich "game not running" weiterzeigte, nachdem das Spiel laengst gestartet war).
+    private readonly System.Windows.Forms.Timer _gameStateTimer = new() { Interval = 2000 };
+    private bool? _lastKnownGameRunning;
+
     public MainForm()
     {
         Text = "STFC Mod Manager";
@@ -112,6 +125,25 @@ public sealed class MainForm : Form
         // asynchronous action (Check updates, ...) is between await points, and running Rescan's own
         // Installer/AppState.Save calls concurrently with that would be exactly the I9 race again.
         Activated += (_, _) => { if (_busy || _game is null) return; Rescan(); RefreshUi(); };
+
+        // Fix-Runde 2, Punkt 1: der fehlende Nachpoll-Mechanismus (s. Feldkommentar bei
+        // _gameStateTimer). Bewusst NICHT auf _busy geprueft: RefreshUi() selbst loest weder
+        // Installer noch AppState.Save aus (nur HealthCheck.Run und ein Neuaufbau der ListView aus
+        // dem bereits im Speicher stehenden _state), das ist also nicht dieselbe Race-Klasse wie
+        // Rescan() im Activated-Handler oder ein zweiter Klick auf einen asynchronen Knopf -- und
+        // selbst wenn der Tick waehrend einer Sperre feuert, gewinnt SetBusy(true)'s
+        // Panel-Deaktivierung ohnehin gegenueber dem, was RefreshUi() an einzelnen Buttons setzt
+        // (ein deaktivierter Container macht seine Kinder unbedienbar, unabhaengig von deren eigenem
+        // Enabled). Nur EIN RefreshUi()-Aufruf pro tatsaechlicher ZustandsAENDERUNG, nicht pro Tick.
+        _gameStateTimer.Tick += (_, _) =>
+        {
+            if (_game is null) return;
+            var running = GameLocator.IsGameRunning();
+            if (_lastKnownGameRunning == running) return;
+            _lastKnownGameRunning = running;
+            RefreshUi();
+        };
+        _gameStateTimer.Start();
     }
 
     private void AddButton(string text, EventHandler onClick)
@@ -122,12 +154,21 @@ public sealed class MainForm : Form
     }
 
     /// <summary>Sperrt/entsperrt die Bedienelemente fuer die Dauer einer echt asynchronen Aktion
-    /// (s. Feldkommentar bei _busy).</summary>
+    /// (s. Feldkommentar bei _busy).
+    ///
+    /// Fix-Runde 2, Punkt 2: zwei offene Tueren gefunden und geschlossen. "Remove all mods" haengt
+    /// am Problems-Tab, nicht an _buttons -- das Deaktivieren der Symbolleiste liess den Knopf
+    /// unberuehrt bedienbar, weil weder er noch das umgebende TabControl je gesperrt wurden.
+    /// AllowDrop blieb ebenfalls durchgehend true, der formularweite Drag-and-Drop-Handler war also
+    /// die ganze Zeit ueber live. Beide erreichen Installer/state.Save() und haetten mit einer
+    /// laufenden Aktualisierung um denselben AppState konkurrieren koennen (I9 aus Fix-Runde 1).</summary>
     private void SetBusy(bool busy)
     {
         _busy = busy;
         _buttons.Enabled = !busy;
         _mods.Enabled = !busy;
+        _removeAllButton.Enabled = !busy;
+        AllowDrop = !busy;
     }
 
     private void LoadState()
@@ -165,8 +206,18 @@ public sealed class MainForm : Form
         // Dateiname -- sonst wuerde ein zweites, gleichnamiges "Core.dll" in einem ANDEREN Unterordner
         // faelschlich als "schon bekannt" uebersprungen. InstalledFile.Path ist seit dem C1-Fix
         // unten immer schon die kanonische Form ("BepInEx\plugins\...").
+        //
+        // Fix-Runde 2, Punkt 4 (Geister-Adoption): state.SharedFiles gehoert mit in die Menge --
+        // eine Beilage, die ApplyPackage als SharedFile statt als eigenen Mod verbucht hat (z. B.
+        // eine zweite, ebenfalls BepInPlugin-markierte DLL im selben Paket), wurde sonst bei JEDEM
+        // Rescan erneut als vermeintlich neuer, eigenstaendiger Mod adoptiert -- "Remove" darauf loescht
+        // nichts (die Datei gehoert ja weiterhin einem echten Mod als Provider) und das Haekchen tut
+        // nichts, weil SetEnabled fuer eine geteilte, von einem anderen aktivierten Mod noch
+        // benoetigte Datei bewusst nichts verschiebt. Beide Pfadformen sind bereits kanonisch, die
+        // Vereinigung ist eine einzige zusaetzliche Zeile.
         var known = state.Mods.SelectMany(m => m.Files)
                               .Select(f => f.Path)
+                              .Concat(state.SharedFiles.Select(f => f.Path))
                               .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         foreach (var (dir, enabled) in new[]
@@ -210,6 +261,13 @@ public sealed class MainForm : Form
                     Files = { new InstalledFile { Path = canonicalRel, Sha256 = Installer.Sha256File(dll) } },
                     InstalledAgainstClientBuild = GameLocator.ReadClientBuild(game.Root)
                 });
+                // Fix-Runde 2, Punkt 4: "known" wurde vorher nur EINMAL vor der Schleife gebaut --
+                // dieselbe Rescan-Schleife durchlaeuft aber BEIDE Ordner (plugins UND
+                // plugins-disabled) nacheinander, und ohne diese Zeile konnten zwei unterschiedliche
+                // Dateien (verschiedene GUID, aber derselbe relative Name je Ordner) denselben
+                // kanonischen Pfad beanspruchen -- zwei ModEntry-Objekte mit identischem Files[0].Path,
+                // und ein Umschalten des einen bewegte physisch die Datei des anderen mit.
+                known.Add(canonicalRel);
                 AppLog.Info($"adopted {info.Guid} {info.Version} from {(enabled ? "plugins" : "plugins-disabled")}");
             }
         }
@@ -287,28 +345,46 @@ public sealed class MainForm : Form
     /// DecideNativeModAction.</summary>
     public static List<Finding> ReconcilePluginFiles(AppState state, GameInstall game)
     {
+        var pluginsPrefix = Path.Combine("BepInEx", "plugins") + Path.DirectorySeparatorChar;
+        var disabledPrefix = Path.Combine("BepInEx", "plugins-disabled") + Path.DirectorySeparatorChar;
+
         var findings = new List<Finding>();
         foreach (var mod in state.Mods.Where(m => m.SourceKind != "native"))
         {
+            // Fix-Runde 2, Punkt 3 (C1 lebte noch weiter): vorher nur Pfade unter BepInEx\plugins
+            // gesehen -- ein Eintrag, dessen Files[0].Path (aus einer Version vor dem Install-Pfad-
+            // Fix in ApplyPackage, oder einer von Hand bearbeiteten state.json) noch woertlich unter
+            // BepInEx\plugins-disabled steht, wurde hier stillschweigend uebersprungen: genau die
+            // Luecke, die der urspruengliche C1-Fund fuer die Adoption schon einmal beschrieb, jetzt
+            // im eigenen Sicherheitsnetz.
             var dll = mod.Files.FirstOrDefault(f =>
                 f.Path.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) &&
-                f.Path.StartsWith(Path.Combine("BepInEx", "plugins") + Path.DirectorySeparatorChar,
-                                   StringComparison.OrdinalIgnoreCase));
+                (f.Path.StartsWith(pluginsPrefix, StringComparison.OrdinalIgnoreCase) ||
+                 f.Path.StartsWith(disabledPrefix, StringComparison.OrdinalIgnoreCase)));
             if (dll is null) continue;
 
+            // Den gespeicherten Pfad JETZT heilen, bevor Installer.PhysicalPath ihn als Basis fuer
+            // beide Kandidatenorte benutzt -- ohne das liefert PhysicalPath fuer einen bereits
+            // falschen ("...plugins-disabled\...") Pfad zwei IDENTISCHE Kandidaten (PluginsRelative
+            // erkennt "plugins-disabled\..." nicht als "unter plugins liegend" und faellt in beiden
+            // Faellen auf denselben kanonischen Pfad zurueck), und die Pruefung unten haette Enabled
+            // dann faelschlich auf true gesetzt, obwohl die Datei nie umgezogen ist -- exakt das
+            // urspruengliche C1-Symptom, nur ueber den Reconcile-Pfad erneut hereingelassen.
+            if (dll.Path.StartsWith(disabledPrefix, StringComparison.OrdinalIgnoreCase))
+                dll.Path = pluginsPrefix + dll.Path[disabledPrefix.Length..];
+
+            var wasEnabled = mod.Enabled;
             string enabledPath, disabledPath;
             try
             {
                 // Installer.PhysicalPath leitet aus mod.Enabled ab -- kurzzeitig beide Zustaende
-                // durchspielen und danach wiederherstellen, statt Installer's Spiegelungsregeln
-                // (Unterordner werden gespiegelt, nicht abgeflacht) hier ein zweites Mal
-                // nachzubauen und so unbemerkt von Installer.cs abzuweichen.
-                var wasEnabled = mod.Enabled;
+                // durchspielen, statt Installer's Spiegelungsregeln (Unterordner werden gespiegelt,
+                // nicht abgeflacht) hier ein zweites Mal nachzubauen und so unbemerkt von
+                // Installer.cs abzuweichen.
                 mod.Enabled = true;
                 enabledPath = Installer.PhysicalPath(game, mod, dll);
                 mod.Enabled = false;
                 disabledPath = Installer.PhysicalPath(game, mod, dll);
-                mod.Enabled = wasEnabled;
             }
             catch (InvalidOperationException)
             {
@@ -316,6 +392,17 @@ public sealed class MainForm : Form
                 // von Hand kaputt bearbeitete state.json) -- Rescan darf daran nicht scheitern,
                 // dieser eine Eintrag wird einfach uebersprungen.
                 continue;
+            }
+            finally
+            {
+                // Fix-Runde 2, Punkt 4: vorher stand die Wiederherstellung als letzte Zeile IM
+                // try-Block -- ein Wurf aus dem zweiten PhysicalPath-Aufruf (mod.Enabled bereits auf
+                // false gesetzt) liess sie nie erreichen und der catch-Zweig gab ohne Wiederherstellung
+                // per "continue" zum naechsten Mod weiter. Verifiziert: das kippte Enabled dauerhaft
+                // von true auf false auf dem Fehlerpfad, und der anschliessende state.Save() in
+                // Rescan() persistierte diesen falschen Wert. finally laeuft garantiert, auch beim
+                // "continue" oben.
+                mod.Enabled = wasEnabled;
             }
 
             switch (DecidePluginReconcileAction(File.Exists(enabledPath), File.Exists(disabledPath)))
@@ -409,6 +496,21 @@ public sealed class MainForm : Form
             AppLog.Error($"toggle of {mod.Id} left files stuck", ex);
             Dialogs.ShowRollbackFailure(this, ex, "Could not change the mod");
         }
+        // Fix-Runde 2, Punkt 4: SetEnabled kann das ueber ResolveInside werfen (z. B. ein
+        // Reparse-Point innerhalb BepInEx\plugins, der physisch aus dem Spielordner hinausfuehrt --
+        // dieselbe Tiefenverteidigung, die Installer ueberall sonst durchzieht). Ohne diesen Fang
+        // landete die Ausnahme ungefangen im globalen Handler (Fix-Runde 1, I8): eine generische
+        // "Unexpected error"-Meldung statt einer erklaerenden, UND das abschliessende RefreshUi()
+        // unten wurde uebersprungen -- das Haekchen blieb visuell umgeschaltet, obwohl
+        // Installer.SetEnabled vor dem Wurf abgebrochen war und mod.Enabled sich nie geaendert hatte.
+        catch (InvalidOperationException ex)
+        {
+            AppLog.Error($"toggle of {mod.Id} failed: a stored path escapes the game folder", ex);
+            MessageBox.Show(this,
+                "The mod could not be enabled or disabled: one of its files has a path that leaves " +
+                "the game folder. See the log for details.",
+                "Could not change the mod", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // Kein ex.Message hier: das waere eine rohe, ggf. vom Betriebssystem lokalisierte
@@ -444,7 +546,11 @@ public sealed class MainForm : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _modContextMenu?.Dispose();
+        if (disposing)
+        {
+            _modContextMenu?.Dispose();
+            _gameStateTimer.Dispose();
+        }
         base.Dispose(disposing);
     }
 

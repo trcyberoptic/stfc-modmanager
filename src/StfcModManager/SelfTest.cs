@@ -941,6 +941,28 @@ internal static class SelfTest
            MainForm.PluginReconcileAction.SetEnabled,
            "plugin-reconcile: file at both locations at once -- the enabled location wins the tie");
 
+        // --- Dialogs.CanonicalizePluginTarget (Fix-Runde 2, Punkt 3) -- reine Umschreibung eines
+        // frisch installierten Zielpfads, getrennt von Installer.Apply/ZipFile-I/O, damit sie ohne
+        // Dateisystem pruefbar ist. Pinnt die Korrektur: C1's Symptom (ein Pfad unter
+        // BepInEx\plugins-disabled wird woertlich als "aktivierter" Ort gespeichert) lebte nicht nur
+        // in der Adoption, sondern auch auf dem Install-Pfad, weil PackageMapper einen Archiveintrag
+        // wie "MyMod/BepInEx/plugins-disabled/FakeA.dll" klaglos auf genau dieses Ziel abbildet.
+        Eq(Dialogs.CanonicalizePluginTarget(@"BepInEx\plugins-disabled\FakeA.dll"),
+           @"BepInEx\plugins\FakeA.dll",
+           "canonicalize-target: a target under plugins-disabled is rewritten to the canonical plugins location");
+        Eq(Dialogs.CanonicalizePluginTarget(@"BepInEx\plugins-disabled\Sub\FakeA.dll"),
+           @"BepInEx\plugins\Sub\FakeA.dll",
+           "canonicalize-target: the mirrored subfolder structure is preserved, not flattened");
+        Eq(Dialogs.CanonicalizePluginTarget(@"BepInEx\plugins\FakeA.dll"),
+           @"BepInEx\plugins\FakeA.dll",
+           "canonicalize-target: a target already under plugins passes through unchanged");
+        Eq(Dialogs.CanonicalizePluginTarget("version.dll"),
+           "version.dll",
+           "canonicalize-target: a game-root target (version.dll) is untouched -- it is not under plugins at all");
+        Eq(Dialogs.CanonicalizePluginTarget(@"BepInEx\config\FakeA.cfg"),
+           @"BepInEx\config\FakeA.cfg",
+           "canonicalize-target: a config target is untouched -- it is not under plugins at all");
+
         FileSystemChecks();
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
