@@ -10,6 +10,12 @@ namespace StfcModManager.Core;
 /// </summary>
 public static partial class Redactor
 {
+    // Die Schluesselwoerter selbst, EINMAL definiert und in Left/Right/SecretAssignment
+    // wiederverwendet (s. dort) -- zwei unabhaengig gepflegte Listen wuerden ueber Zeit
+    // auseinanderlaufen. "pw" und "passwd" (Fix-Runde 1, I3) sind gaengige Kurzformen von
+    // "password", die sonst unredigiert durchgingen.
+    private const string Keywords = "key|token|secret|password|passwd|pw|passwort|api|auth|authorization";
+
     // Bezeichner-Grenze fuer zusammengesetzte Namen (PascalCase "ApiKey", snake_case "deepl_api_key").
     // Ein blosses \b reicht NICHT: \w schliesst den Unterstrich ein, also gibt es innerhalb von
     // "deepl_api_key" gar keine \b-Grenze um "api" oder "key" -- und \b ignoriert Gross-/
@@ -17,26 +23,43 @@ public static partial class Redactor
     // urspruenglich vorgeschlagenen \b(?:key|token|...)\b haetten NICHT EINMAL die beiden
     // wortwoertlichen Beispiele aus der Aufgabenstellung ("ApiKey = ...", "deepl_api_key: ...")
     // gegriffen -- am echten .NET-Regex-Modul nachgemessen, bevor diese Fassung geschrieben wurde
-    // (s. Taskbericht). Eine Grenze gilt hier, wenn davor/danach kein Buchstabe/Ziffer steht (deckt
-    // Leerzeichen, Satzzeichen UND den Unterstrich ab) ODER an einem klein-zu-Gross-Uebergang (deckt
-    // PascalCase/camelCase ab). "(?-i:...)" schaltet die aeussere IgnoreCase-Option innerhalb der
-    // Gross-/Kleinschreibungspruefung gezielt wieder aus -- sonst wuerde [A-Z] auch Kleinbuchstaben
-    // treffen und die Erkennung waere wirkungslos.
+    // (s. Taskbericht).
+    //
+    // Drei Klauseln, nicht zwei (Fix-Runde 1, I3): (1) davor/danach kein Buchstabe/Ziffer (deckt
+    // Leerzeichen, Satzzeichen UND den Unterstrich ab), (2) ein klein-zu-Gross-Uebergang (deckt
+    // PascalCase/camelCase wie "ApiKey" ab), (3) unmittelbar angrenzend an ein ANDERES Schluesselwort
+    // aus derselben Liste (deckt zusammengesetzte Namen OHNE jedes Gross-/Kleinschreibungssignal ab,
+    // z. B. "APIKEY" oder "apikey" -- dort gibt es zwischen "API"/"api" und "KEY"/"key" gar keinen
+    // Uebergang, den Klausel 2 erkennen koennte). "(?-i:...)" schaltet die aeussere IgnoreCase-Option
+    // innerhalb der Gross-/Kleinschreibungspruefung gezielt wieder aus -- sonst wuerde [A-Z] auch
+    // Kleinbuchstaben treffen und die Erkennung waere wirkungslos. Klausel 3 bleibt dagegen bewusst
+    // IgnoreCase-empfindlich (kein "(?-i:...)" dort), damit sie "API" genauso wie "api" erkennt.
     //
     // Links und rechts sind NICHT dieselbe Pruefung, obwohl \b es waere: links muss das Zeichen
     // DAVOR kein Buchstabe/Ziffer sein (Lookbehind), rechts muss das Zeichen DANACH keiner sein
     // (Lookahead). Eine erste Fassung benutzte irrtuemlich denselben Lookbehind auf beiden Seiten --
     // damit griff die rechte Grenze nie (ein Lookbehind prueft immer nach LINKS, unabhaengig davon,
     // wo er im Muster steht), und selbst die woertlichen Beispiele der Aufgabenstellung
-    // ("Password=...", "Authorization: ...") schlugen fehl, weil "password"/"authorization" am
-    // Zeilenanfang zwar links, aber nie rechts als Grenze erkannt wurden. Am echten .NET-Regex-Modul
-    // nachgemessen (s. Taskbericht), bevor diese Fassung geschrieben wurde.
-    private const string Left = @"(?:(?<![A-Za-z0-9])|(?<=(?-i:[a-z]))(?=(?-i:[A-Z])))";
-    private const string Right = @"(?:(?![A-Za-z0-9])|(?<=(?-i:[a-z]))(?=(?-i:[A-Z])))";
+    // ("Password=...", "Authorization: ...") schlugen fehl. Am echten .NET-Regex-Modul nachgemessen
+    // (s. Taskbericht), bevor diese Fassung geschrieben wurde -- ebenso wie Klausel 3 unten.
+    private const string Left = @"(?:(?<![A-Za-z0-9])|(?<=(?-i:[a-z]))(?=(?-i:[A-Z]))|(?<=" + Keywords + "))";
+    private const string Right = @"(?:(?![A-Za-z0-9])|(?<=(?-i:[a-z]))(?=(?-i:[A-Z]))|(?=" + Keywords + "))";
 
-    [GeneratedRegex(@"^(?<head>[^=:\r\n]*" + Left
-                   + @"(?:key|token|secret|password|passwort|api|auth|authorization)" + Right
-                   + @"[^=:\r\n]*)(?<sep>\s*[=:]\s*)(?<val>\S.*)$",
+    // Fix-Runde 1, C1 (kritisch): die fruehere Fassung liess nach dem Schluesselwort ein
+    // UNBESCHRAENKTES "[^=:\r\n]*" bis zum naechsten Trenner laufen -- auf einer normalen
+    // Ausnahme- oder Stacktrace-Zeile kann DAS ein voelliger anderer, viel spaeterer ':' oder '='
+    // sein (ein Laufwerksbuchstabe in einem Pfad, ein zweiter Doppelpunkt in einer
+    // Exception.ToString()-Zeile), und ALLES dazwischen -- die eigentliche Fehlermeldung, der
+    // Dateipfad -- verschwand hinter "[REDACTED]". "System.Collections.Generic.
+    // KeyNotFoundException: The given key was not present..." und Stacktraces wie
+    // "...AuthTokenManager.cs:line 42" wurden so bis zur Unbrauchbarkeit verstuemmelt, obwohl in
+    // ihnen gar keine Zuweisung steht -- genau die Information, fuer die ein Supportpaket ueberhaupt
+    // existiert. Jetzt duerfen zwischen dem Schluesselwort und dem eigentlichen Trenner nur noch
+    // Leerzeichen/Tabs stehen (hoechstens acht, als zusaetzliche Vorsichtsgrenze) -- reicht fuer
+    // "ApiKey    = ..." oder "DeeplApiKey = ...", nicht aber fuer beliebigen Fliesstext. Am echten
+    // .NET-Regex-Modul mit genau den beiden Beispielen oben gegengeprueft (s. Taskbericht).
+    [GeneratedRegex(@"^(?<head>[^=:\r\n]*" + Left + "(?:" + Keywords + ")" + Right
+                   + @"[ \t]{0,8})(?<sep>\s*[=:]\s*)(?<val>\S.*)$",
                     RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex SecretAssignment();
 
@@ -45,7 +68,20 @@ public static partial class Redactor
 
     // Mindestens 24 alphanumerische Zeichen mit wenigstens einer Ziffer:
     // trifft Spieler-uids, Sitzungstoken und Pruefsummen.
-    [GeneratedRegex(@"\b(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{24,}\b", RegexOptions.CultureInvariant)]
+    //
+    // Fix-Runde 1, I4: \b hat hier dasselbe Problem wie bei SecretAssignment -- der Unterstrich ist
+    // ein \w-Zeichen, also gibt es KEINE \b-Grenze zwischen "_" und dem eigentlichen Zufallsteil
+    // eines Tokens wie "sk_live_4eC39HqLyjWDarjtT1zdp7dc" oder "ghp_<36 zufaellige Zeichen>" --
+    // beides reale API-Schluessel-Formate (Stripe, GitHub), beide mit genau EINEM trennenden
+    // Unterstrich vor einem laengeren, in sich zusammenhaengenden Zufallsteil. Ersetzt durch dieselbe
+    // Grenze wie bei Left/Right oben (Klausel 1: kein Buchstabe/Ziffer davor/danach), aber OHNE die
+    // Gross-/Kleinschreibungs- oder Nachbarwort-Klauseln -- die braucht LongId nicht, es geht nur um
+    // eine zusammenhaengende Zeichenfolge, nicht um zusammengesetzte Bezeichner. "ordinary-hyphenated-
+    // word-list" bleibt trotzdem unberuehrt: jedes einzelne Segment darin ist zu kurz UND enthaelt
+    // keine Ziffer, die Schwelle von 24 zusammenhaengenden Zeichen mit Ziffer greift nur bei einem
+    // tatsaechlich opaken Block (am echten .NET-Regex-Modul gegengeprueft, s. Taskbericht).
+    [GeneratedRegex(@"(?<![A-Za-z0-9])(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{24,}(?![A-Za-z0-9])",
+                    RegexOptions.CultureInvariant)]
     private static partial Regex LongId();
 
     // Haertung ueber die Aufgabenstellung hinaus: eine klassische GUID (8-4-4-4-12 Hex-Gruppen mit
@@ -53,7 +89,11 @@ public static partial class Redactor
     // LongId allein sieht sie NICHT -- die Bindestriche zerteilen jede zusammenhaengende
     // alphanumerische Folge in Stuecke von hoechstens 12 Zeichen, weit unter der 24-Zeichen-Schwelle.
     // Ohne diese Ergaenzung bliebe eine echte Spieler-GUID im Log unredigiert.
-    [GeneratedRegex(@"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b",
+    //
+    // Dieselbe Unterstrich-Grenzen-Korrektur wie bei LongId (Fix-Runde 1, I4 -- hier nicht explizit
+    // verlangt, aber derselbe Fehlerklasse im selben Codepfad: "session_id_550e8400-...-000_active"
+    // saehe mit \b die GUID sonst ebenfalls nicht, aus demselben Grund.
+    [GeneratedRegex(@"(?<![A-Za-z0-9])[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?![A-Za-z0-9])",
                     RegexOptions.CultureInvariant)]
     private static partial Regex GuidLike();
 

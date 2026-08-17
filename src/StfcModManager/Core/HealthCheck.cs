@@ -85,7 +85,11 @@ public static partial class HealthCheck
                       + "These hook the same functions as several plugins and crash the game natively at login.",
                         "Set both keys to false in community_patch_settings.toml, section [patches]."));
             }
-            catch (IOException) { /* nicht lesbar: Pruefung entfaellt */ }
+            // Fix-Runde 1, C2: UnauthorizedAccessException (ACL-verweigert, Virenscanner-Quarantaene)
+            // erbt NICHT von IOException -- beide stammen direkt von SystemException ab -- und
+            // wurde hier bisher nicht gefangen, obwohl das genau der Klassenzusicherung oben
+            // widerspricht ("kein Maschinenzustand darf werfen lassen").
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { /* nicht lesbar: Pruefung entfaellt */ }
         }
 
         // 8 Fehler aus dem Spiel-Log

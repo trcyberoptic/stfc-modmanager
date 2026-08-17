@@ -36,8 +36,12 @@ public static partial class LogReader
         }
         // Das Spiel kann die Datei exklusiv halten (kein FileShare.ReadWrite auf seiner Seite) oder
         // sie kann waehrend des Lesens verschwinden -- ein Health-Check darf dafuer nie abstuerzen,
-        // sondern liest einfach nichts.
-        catch (IOException) { return []; }
+        // sondern liest einfach nichts. Fix-Runde 1, C2: UnauthorizedAccessException (ACL-verweigert,
+        // von einem Virenscanner unter Quarantaene gestellt) erbt NICHT von IOException -- beide
+        // stammen direkt von SystemException ab -- und wurde hier bisher NICHT gefangen, obwohl genau
+        // dieser Fall den ganzen Health-Check zum Absturz gebracht haette, entgegen dessen eigenem
+        // Klassenkommentar ("kein Maschinenzustand darf werfen").
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return []; }
 
         return tail.Select(ParseLine)
                    .Where(e => e is not null && e.Level is "Warning" or "Error" or "Fatal")

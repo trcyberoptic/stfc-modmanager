@@ -779,6 +779,56 @@ internal static class SelfTest
            "ApiKey = [REDACTED]" + Environment.NewLine + "MaxLevel = 40" + Environment.NewLine,
            "redact: RedactText redacts a secret line and leaves a harmless line untouched, line by line");
 
+        // --- Redactor: Fix-Runde 1, C1 (kritisch) -- Ausnahme-/Stacktrace-Zeilen duerfen nicht
+        // hinter der Schluessel-Zuweisungs-Erkennung verschwinden. Vor der Korrektur schluckte das
+        // unbeschraenkte "[^=:\r\n]*" nach dem Schluesselwort alles bis zum NAECHSTEN ':' oder '='
+        // irgendwo spaeter in der Zeile -- ein Laufwerksbuchstabe in einem Pfad oder der zweite
+        // Doppelpunkt einer Exception.ToString()-Zeile genuegte. Diese drei Zeilen pinnen genau das
+        // Gegenteil: der Text muss VOLLSTAENDIG ueberleben, nicht nur teilweise.
+        const string keyNotFound =
+            "System.Collections.Generic.KeyNotFoundException: The given key was not present in the dictionary.";
+        Eq(Redactor.RedactLine(keyNotFound), keyNotFound,
+           "redact: a KeyNotFoundException message is not swallowed by the key-assignment pattern");
+        const string authStackFrame =
+            @"   at UniversalTranslator.AuthTokenManager.Refresh() in C:\Users\Foo\AuthTokenManager.cs:line 42";
+        Eq(Redactor.RedactLine(authStackFrame), authStackFrame,
+           "redact: a stack frame with a drive-letter path ('Auth' in the type name) survives untouched");
+        const string tokenStackFrame =
+            @"   at MyMod.TokenValidator.Validate() in C:\Users\Foo\TokenValidator.cs:line 10";
+        Eq(Redactor.RedactLine(tokenStackFrame), tokenStackFrame,
+           "redact: a stack frame with 'Token' in a method/class name survives untouched");
+
+        // --- Redactor: Fix-Runde 1, I3 -- weitere Schluesselwoerter und Bezeichner ganz ohne
+        // Gross-/Kleinschreibungssignal. Die Klasse pruefte sich selbst als "bewusst grosszuegig",
+        // aber "pw"/"passwd" fehlten in der Liste, und ein rein durchgehend klein- oder
+        // grossgeschriebenes "apikey"/"APIKEY" hatte gar keinen klein-zu-Gross-Uebergang, an dem die
+        // fruehere Grenze haette greifen koennen. ---
+        Eq(Redactor.RedactLine("pw = hunter2"), "pw = [REDACTED]", "redact: the short 'pw' alias for password");
+        Eq(Redactor.RedactLine("passwd = hunter2"), "passwd = [REDACTED]", "redact: the 'passwd' alias for password");
+        Eq(Redactor.RedactLine("APIKEY = sekret1"), "APIKEY = [REDACTED]",
+           "redact: an all-uppercase compound with no case transition ('APIKEY') still redacts");
+        Eq(Redactor.RedactLine("apikey = hunter2value"), "apikey = [REDACTED]",
+           "redact: an all-lowercase compound with no case transition ('apikey') still redacts");
+
+        // --- Redactor: Fix-Runde 1, I4 -- opake Token mit internen Unterstrichen/Bindestrichen ---
+        // Wie beim urspruenglichen \b-Fehler blockierte der Unterstrich vor dem eigentlichen
+        // Zufallsteil eines Tokens die \b-Grenze von LongId komplett -- reale Formate (Stripe,
+        // GitHub) haben genau diese Form: ein kurzes Praefix, EIN Unterstrich, dann ein langer
+        // zusammenhaengender Zufallsblock ganz ohne eigene Zuweisungsform im Log.
+        Eq(Redactor.RedactLine("key sk_live_4eC39HqLyjWDarjtT1zdp7dc leaked"),
+           "key sk_live_[REDACTED-ID] leaked", "redact: a Stripe-style key with an underscore prefix is redacted");
+        Eq(Redactor.RedactLine("token ghp_1234567890abcdefghijklmnopqrstuvwxyz leaked"),
+           "token ghp_[REDACTED-ID] leaked", "redact: a GitHub-style token with an underscore prefix is redacted");
+        // Gegenprobe (ausdruecklich verlangt): ein gewoehnlicher, mit Bindestrichen geschriebener
+        // Ausdruck darf davon NICHT erfasst werden -- jedes einzelne Segment ist zu kurz und enthaelt
+        // keine Ziffer, die 24-Zeichen-Schwelle mit Ziffernpflicht bleibt die schuetzende Grenze.
+        const string ordinaryHyphenated = "ordinary-hyphenated-word-list should stay clean";
+        Eq(Redactor.RedactLine(ordinaryHyphenated), ordinaryHyphenated,
+           "redact: an ordinary hyphenated phrase with no digits is not mistaken for an opaque token");
+        const string versionedPhrase = "windows-10-update-notes-panel should stay clean too";
+        Eq(Redactor.RedactLine(versionedPhrase), versionedPhrase,
+           "redact: a hyphenated phrase containing a short digit segment ('10') is not mistaken for an opaque token");
+
         FileSystemChecks();
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
@@ -863,6 +913,14 @@ internal static class SelfTest
             Guarded("Create enforces the total budget across multiple collected files", () => CheckSupportBundleTotalBudgetExhaustion(root));
             Guarded("Create does not throw when a source file is locked, and records it as unreadable", () => CheckSupportBundleCreateLockedSourceFile(root));
             Guarded("Create succeeds with no config folder and no BepInEx files present at all", () => CheckSupportBundleCreateOnBareGameFolder(root));
+
+            // --- Fix-Runde 1, C2: IOException allein reicht nicht -- UnauthorizedAccessException
+            // (ACL-verweigert, Virenscanner-Quarantaene) erbt NICHT davon. Pruefung mit einer ECHT
+            // per ACL gesperrten Datei, nicht nur mit einem Freigabe-Konflikt (den deckten die
+            // Sperr-Pruefungen oben bereits ab, aber der ist eine IOException und haette diese
+            // Luecke nie aufgedeckt).
+            Guarded("LogReader.ReadTail does not throw on a genuinely ACL-denied file", () => CheckLogReaderReadTailAclDenied(root));
+            Guarded("HealthCheck.Run does not throw when the community-patch toml is ACL-denied", () => CheckHealthCheckAclDeniedCommunityPatchToml(root));
         }
         finally
         {
@@ -2130,5 +2188,107 @@ internal static class SelfTest
               "fs: the three self-generated files are still written even with nothing to collect");
         Check(!names.Any(n => n.StartsWith("collected/", StringComparison.Ordinal) && n.EndsWith(".cfg")),
               "fs: no .cfg entries when the game folder has no BepInEx config at all");
+    }
+
+    // ===================================================================================
+    // Fix-Runde 1, C2: eine Freigabe-Sperre (FileShare.None, s. oben) ist eine IOException. Eine
+    // per ACL verweigerte Datei (Berechtigungen, Virenscanner-Quarantaene) ist dagegen eine
+    // UnauthorizedAccessException -- die erbt NICHT von IOException, beide stammen direkt von
+    // SystemException ab. Nur ein Test mit einer ECHT per ACL gesperrten Datei deckt das auf; die
+    // bisherigen Sperr-Pruefungen taten das nicht, weil sie ausschliesslich die Freigabe-Variante
+    // prueften. Eine explizite Deny-ACE auf die eigene Datei zu setzen braucht KEINE Elevation --
+    // der Besitzer darf sich selbst per WRITE_DAC das Lesen verweigern (anders als das Aendern des
+    // Besitzers einer FREMDEN Datei, das echte Elevation braucht).
+    // ===================================================================================
+
+    /// <summary>Versucht, dem aktuellen Benutzer per expliziter Deny-ACE das Lesen der gegebenen
+    /// Datei zu verweigern -- absichtlich nur ReadData, NICHT FullControl/Delete, damit die
+    /// abschliessende Aufraeumroutine der Testumgebung die Datei trotzdem loeschen kann. Liefert
+    /// false (statt zu werfen), wenn die Umgebung das nicht zulaesst -- der Aufrufer ueberspringt
+    /// dann den Rest der Pruefung, statt die Suite scheitern zu lassen (dieselbe Konvention wie bei
+    /// den Junction-/Symlink-Pruefungen weiter oben).</summary>
+    private static bool TryDenyRead(string path, out Action restore)
+    {
+        restore = static () => { };
+        try
+        {
+            var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            if (identity.User is null) return false;
+
+            var fileInfo = new FileInfo(path);
+            var security = fileInfo.GetAccessControl();
+            var rule = new System.Security.AccessControl.FileSystemAccessRule(
+                identity.User,
+                System.Security.AccessControl.FileSystemRights.ReadData,
+                System.Security.AccessControl.AccessControlType.Deny);
+            security.AddAccessRule(rule);
+            fileInfo.SetAccessControl(security);
+
+            restore = () =>
+            {
+                try
+                {
+                    var fi = new FileInfo(path);
+                    var sec = fi.GetAccessControl();
+                    sec.RemoveAccessRule(rule);
+                    fi.SetAccessControl(sec);
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            };
+            return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException
+                                    or System.Security.Principal.IdentityNotMappedException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Fix-Runde 1, C2: LogReader.ReadTail faengt bisher nur IOException. Eine echt per ACL
+    /// gesperrte Datei wirft UnauthorizedAccessException und muss genauso leise mit [] enden.</summary>
+    private static void CheckLogReaderReadTailAclDenied(string root)
+    {
+        var dir = Path.Combine(root, "log-acl-denied");
+        Directory.CreateDirectory(dir);
+        var logPath = Path.Combine(dir, "LogOutput.log");
+        File.WriteAllText(logPath, "[Error :Src] boom\n");
+
+        if (!TryDenyRead(logPath, out var restore))
+        {
+            Console.WriteLine("fs: LogReader ACL-denied check skipped: could not set a deny ACE in this environment");
+            return;
+        }
+        try
+        {
+            var result = LogReader.ReadTail(logPath); // darf trotz ACL-Verweigerung nicht werfen
+            Eq(result.Count, 0, "fs: ReadTail returns an empty list, not a throw, for a genuinely ACL-denied file");
+        }
+        finally { restore(); }
+    }
+
+    /// <summary>Fix-Runde 1, C2: dieselbe Luecke im TOML-Lesepfad von HealthCheck (Pruefung 6) --
+    /// ein ACL-verweigertes community_patch_settings.toml durfte den ganzen Health-Check nicht mehr
+    /// zum Absturz bringen, die Pruefung faellt dann einfach aus.</summary>
+    private static void CheckHealthCheckAclDeniedCommunityPatchToml(string root)
+    {
+        var gameRoot = Path.Combine(root, "hc-acl-denied");
+        Put(Path.Combine(gameRoot, "prime.exe"), "GAME");
+        Put(Path.Combine(gameRoot, "version.dll"), "NATIVE");
+        var tomlPath = Put(Path.Combine(gameRoot, "community_patch_settings.toml"),
+            "[patches]\ngame_version = true\n");
+        var game = new GameInstall(gameRoot);
+
+        if (!TryDenyRead(tomlPath, out var restore))
+        {
+            Console.WriteLine("fs: HealthCheck ACL-denied check skipped: could not set a deny ACE in this environment");
+            return;
+        }
+        try
+        {
+            var findings = HealthCheck.Run(new AppState(), game); // darf trotz ACL-Verweigerung nicht werfen
+            Check(!findings.Any(x => x.Title.Contains("Community Mod")),
+                  "fs: with the toml ACL-denied, HealthCheck reports no community-patch finding instead of throwing");
+        }
+        finally { restore(); }
     }
 }
