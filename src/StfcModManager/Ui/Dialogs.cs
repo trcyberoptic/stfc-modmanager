@@ -52,7 +52,8 @@ public static class Dialogs
     /// rohe I/O- und Netzwerkfehler in genau so einen Text zu uebersetzen, bevor sie eine
     /// oeffentliche Methode verlassen. Fuer jede andere Ausnahmeart (IOException,
     /// UnauthorizedAccessException, ein ArgumentException aus Installer.Apply's Vorflug,
-    /// InvalidDataException aus einer beschaedigten Zip-Datei, ...) waere e.Message dagegen
+    /// InvalidDataException aus einer beschaedigten Zip-Datei, eine rohe TaskCanceledException aus
+    /// einer Zeitueberschreitung mitten im Lesen einer HTTP-Antwort, ...) waere e.Message dagegen
     /// potenziell die rohe, ggf. vom Betriebssystem lokalisierte Meldung -- genau das, was laut
     /// Vorgabe nie vor dem Nutzer landen darf. Ein fest formulierter Ausweichtext haelt diese
     /// Zusicherung unabhaengig davon ein, welche konkrete Ausnahmeart ein Aufrufer im Einzelfall
@@ -60,6 +61,16 @@ public static class Dialogs
     /// im Log.</summary>
     private static string SafeUserMessage(Exception e, string fallback) =>
         e is InvalidOperationException or InstallRollbackException ? e.Message : fallback;
+
+    /// <summary>Menschenlesbare Groessenangabe fuer die Vertrauensanzeige (Cheap Fix, Fix-Runde 1).
+    /// Formatiert nur die Zahl -- ob sie "as declared by GitHub" ist, sagt der Aufrufer dazu, weil
+    /// diese Funktion selbst nichts ueber die Herkunft der Zahl weiss.</summary>
+    private static string FormatBytes(long bytes) => bytes switch
+    {
+        >= 1_000_000 => $"{bytes / 1_000_000.0:0.#} MB",
+        >= 1_000 => $"{bytes / 1_000.0:0.#} KB",
+        _ => $"{bytes} bytes"
+    };
 
     /// <summary>Zeigt eine InstallRollbackException verstaendlich an: welche Dateien betroffen sind
     /// und wo die Sicherung liegt, statt eines Stacktraces oder eines Achselzuckens. ex.Message ist
@@ -109,8 +120,22 @@ public static class Dialogs
             }
 
             var names = release.Assets.Select(a => a.Name).ToList();
+
+            // Fix-Runde 1, I3: InstallableCandidates existiert genau fuer diese Unterscheidung
+            // (s. dortiger Kommentar in GitHubClient.cs) -- ohne sie ging jeder Assetname (.exe,
+            // .txt, .sha256, Quellarchive) unveraendert an den Auswahldialog, und ein Release ganz
+            // ohne etwas Installierbares sah fuer den Nutzer identisch zu einem mehrdeutigen aus: er
+            // waehlte etwas aus, wartete einen Download ab, und bekam erst danach "Package refused".
+            var candidates = GitHubClient.InstallableCandidates(names);
+            if (candidates.Count == 0)
+            {
+                MessageBox.Show(owner, "The latest release of that repository has no installable .zip or .dll file.",
+                                "Nothing to install", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
             var chosen = GitHubClient.PickAsset(names, null)
-                      ?? ChooseFromList(owner, "Which file should be installed?", names);
+                      ?? ChooseFromList(owner, "Which file should be installed?", candidates);
             if (chosen is null) return;
 
             var asset = release.Assets.First(a => a.Name == chosen);
@@ -132,7 +157,13 @@ public static class Dialogs
         }
     }
 
-    private static void InstallFromGitHub(IWin32Window owner, AppState state, GameInstall game,
+    /// <summary>True, wenn der Mod tatsaechlich installiert/aktualisiert wurde -- false fuer jeden
+    /// Fall, in dem ApplyPackage das Paket ablehnt (kein Plugin gefunden), OHNE dass das eine
+    /// Ausnahme war. Der Rueckgabewert existiert fuer die Stapelverarbeitung (Fix-Runde 1, Cheap
+    /// Fix): ohne ihn hatte ein Aufrufer wie CheckUpdatesAsync keine Moeglichkeit, "abgelehnt" von
+    /// "installiert" zu unterscheiden, und liess eine AvailableVersion stehen, die bei jedem
+    /// kuenftigen Versuch wieder an derselben Ablehnung scheitern wuerde.</summary>
+    private static bool InstallFromGitHub(IWin32Window owner, AppState state, GameInstall game,
                                           string repo, ReleaseInfo release, ReleaseAsset asset)
     {
         var file = GitHubClient.DownloadAssetAsync(asset, AppPaths.DownloadDir, CancellationToken.None)
@@ -146,7 +177,7 @@ public static class Dialogs
         {
             MessageBox.Show(owner, map.Rejection + "\r\n\r\nNothing was installed.",
                             "Package refused", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return;
+            return false;
         }
 
         var sha = Installer.Sha256File(file);
@@ -159,11 +190,12 @@ public static class Dialogs
             // erst NACH einem "Ja" ergaenzt, nicht vorher.
             var targets = string.Join("\r\n", map.Files.Select(m => "  " + m.Target));
             var answer = MessageBox.Show(owner,
-                $"Repository : {repo}\r\nRelease    : {release.Tag}\r\nFile       : {asset.Name} ({asset.Size} bytes)\r\n" +
+                $"Repository : {repo}\r\nRelease    : {release.Tag}\r\n" +
+                $"File       : {asset.Name} ({FormatBytes(asset.Size)}, as declared by GitHub)\r\n" +
                 $"SHA-256    : {sha}\r\n\r\nThese files will be written into your game folder:\r\n{targets}\r\n\r\n" +
                 "This code will run inside the game. Only continue if you trust the author. Install?",
                 "Confirm installation", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-            if (answer != DialogResult.Yes) return;
+            if (answer != DialogResult.Yes) return false;
             state.TrustedRepos.Add(repo);
 
             // Sofort sichern statt auf ApplyPackage's eigenen state.Save() am Ende zu vertrauen:
@@ -178,8 +210,8 @@ public static class Dialogs
             state.Save();
         }
 
-        ApplyPackage(owner, state, game, file, map, sourceKind: "github",
-                     repo: repo, tag: release.Tag, assetName: asset.Name, etag: release.ETag);
+        return ApplyPackage(owner, state, game, file, map, sourceKind: "github",
+                            repo: repo, tag: release.Tag, assetName: asset.Name, etag: release.ETag);
     }
 
     // ---------- lokal ----------
@@ -214,7 +246,9 @@ public static class Dialogs
 
     // ---------- gemeinsamer Installationsweg ----------
 
-    private static void ApplyPackage(IWin32Window owner, AppState state, GameInstall game,
+    /// <summary>Fuehrt ein zugeordnetes Paket tatsaechlich in den Spielordner ein. Rueckgabewert s.
+    /// InstallFromGitHub-Kommentar: true nur, wenn wirklich etwas installiert wurde.</summary>
+    private static bool ApplyPackage(IWin32Window owner, AppState state, GameInstall game,
                                      string packagePath, MapResult map, string sourceKind,
                                      string? repo, string? tag, string? assetName, string? etag)
     {
@@ -232,7 +266,20 @@ public static class Dialogs
                 {
                     var entry = zip.GetEntry(m.Entry);
                     if (entry is null) continue;
-                    var tmp = Path.Combine(staging, Path.GetFileName(m.Target));
+                    // Fix-Runde 1, I1 (wichtig): der relative Zielpfad wird unter staging GESPIEGELT,
+                    // nicht auf staging\<Dateiname> abgeflacht. PackageMapper erlaubt ausdruecklich
+                    // zwei Eintraege wie "BepInEx\plugins\ModA\Core.dll" UND
+                    // "BepInEx\plugins\ModB\Core.dll" -- verschiedene Zielpfade, keine Ablehnung.
+                    // Beide waeren vorher in derselben Nebendatei "staging\Core.dll" gelandet und
+                    // haetten sich dort gegenseitig ueberschrieben: ModInspector.Read auf der zuletzt
+                    // gewinnenden Kopie konnte den Mod dann unter der FALSCHEN GUID/Version
+                    // registrieren, waehrend Installer.Apply gleich darauf trotzdem den richtigen
+                    // Zielpfad korrekt beschreibt -- die Buchfuehrung wich von der Platte ab, ohne
+                    // dass der gespeicherte SHA (der ja zum tatsaechlich geschriebenen Inhalt passt)
+                    // je etwas davon verraten haette. Dieselbe Spiegelung, die Installer.Apply fuer
+                    // seine eigene Sicherung schon benutzt (s. dortiger Kommentar).
+                    var tmp = Path.Combine(staging, m.Target);
+                    Directory.CreateDirectory(Path.GetDirectoryName(tmp)!);
                     entry.ExtractToFile(tmp, overwrite: true);
                     ops.Add((tmp, m.Target));
                 }
@@ -258,7 +305,22 @@ public static class Dialogs
                 MessageBox.Show(owner,
                     "No BepInEx plugin was found in this package. Install it manually if you are sure it belongs here.",
                     "Not a plugin", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
+                return false;
+            }
+
+            // Fix-Runde 1, I2: der eigentliche Schreibpunkt. Guard() in MainForm (bzw. die Pruefung
+            // im jeweiligen Aufrufer von ApplyPackage) laeuft VOR einem unter Umstaenden lange
+            // offenen, unbeschraenkten Dialog dazwischen -- der OpenFileDialog bei "Add local…", der
+            // URL-Prompt plus Netzwerk plus Vertrauensdialog bei "Add from GitHub…", die
+            // Bestaetigung bei Remove. Der Nutzer kann das Spiel genau in diesem Fenster starten.
+            // Hier, unmittelbar vor Installer.Apply, ist der letztmoegliche und damit einzig
+            // verlaessliche Ort fuer diese Pruefung.
+            if (GameLocator.IsGameRunning())
+            {
+                MessageBox.Show(owner,
+                    "Star Trek Fleet Command is running. Close it completely, then try again.",
+                    "Game is running", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
             }
 
             var installed = Installer.Apply(game.Root, ops);
@@ -286,6 +348,7 @@ public static class Dialogs
 
             state.Save();
             AppLog.Info($"installed {info.Guid} {info.Version} from {sourceKind}");
+            return true;
         }
         catch (InstallRollbackException ex)
         {
@@ -295,6 +358,7 @@ public static class Dialogs
             // Sicherung liegt, nicht nur "etwas ist schiefgegangen".
             AppLog.Error("install left files stuck", ex);
             ShowRollbackFailure(owner, ex, "Installation failed");
+            return false;
         }
         // Installer.Apply's Vorflugpruefungen werfen je nach Grund entweder InvalidOperationException
         // (ein Ziel entkaeme dem Spielordner, auch ueber einen Reparse-Point) oder ArgumentException
@@ -313,6 +377,7 @@ public static class Dialogs
                 SafeUserMessage(e, "Installation failed. The package may be corrupted, or a file could " +
                     "not be written because it is locked by the game or another program. See the log for details."),
                 "Installation failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
         }
         finally
         {
@@ -345,12 +410,17 @@ public static class Dialogs
                 mod.AvailableVersion = release.Tag.TrimStart('v', 'V');
                 updated.Add($"{mod.Name}: {mod.Version} → {mod.AvailableVersion}");
             }
-            // GetLatestReleaseAsync uebersetzt jeden Fehlschlag in eine InvalidOperationException mit
-            // fertigem Text -- e.Message ist hier deshalb sicher direkt anzuzeigen.
             catch (Exception e) when (e is HttpRequestException or InvalidOperationException or TaskCanceledException)
             {
                 AppLog.Error($"update check failed for {mod.Repo}", e);
-                failed.Add($"{mod.Name}: {e.Message}");
+                // Fix-Runde 1, I5: GetLatestReleaseAsync uebersetzt einen Fehlschlag beim ANFORDERN
+                // der Antwort in eine InvalidOperationException mit fertigem Text -- aber NICHT eine
+                // Zeitueberschreitung WAEHREND res.Content.ReadAsStringAsync (dessen eigener Fang
+                // deckt nur IOException/HttpRequestException ab, s. GitHubClient.cs). Eine so
+                // entstehende rohe TaskCanceledException traegt Framework-Text (auf diesem Rechner
+                // deutsch) -- die eine Stelle in beiden Dateien, die bisher unter dem eigenen
+                // SafeUserMessage-Grundsatz durchgerutscht war.
+                failed.Add($"{mod.Name}: {SafeUserMessage(e, "could not be checked (network problem). See the log for details.")}");
             }
         }
 
@@ -375,38 +445,89 @@ public static class Dialogs
         if (MessageBox.Show(owner, message + "\r\nInstall the updates now?", "Check updates",
                             MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
 
-        // Punkt 1 der Aufgabenstellung: JEDE destruktive Aktion muss blockiert sein, waehrend das
-        // Spiel laeuft. Der erste Teil dieser Methode (Releases abfragen) ist reine Netzwerkarbeit
-        // und braucht diese Pruefung nicht -- aber ab hier werden tatsaechlich Dateien in den
-        // Spielordner geschrieben, und MainForm.OnCheckUpdates ruft (anders als bei jeder anderen
-        // destruktiven Aktion) kein Guard() auf, weil das Pruefen selbst nicht blockiert werden soll.
-        // Die Pruefung gehoert deshalb GENAU HIERHIN: unmittelbar vor der ersten schreibenden
-        // Operation, nicht schon vor dem Abfragen der Releases (das wuerde harmlose Anfragen unnoetig
-        // verweigern) und nicht in MainForm (das wuerde auch das reine Pruefen blockieren).
-        if (GameLocator.IsGameRunning())
+        await InstallPendingUpdatesAsync(owner, state, game);
+    }
+
+    /// <summary>Spec §12: eigenstaendiger "Update all"-Weg -- installiert alles, was bereits eine
+    /// AvailableVersion traegt (aus einem frueheren "Check updates"), ohne selbst erneut beim GitHub
+    /// abzufragen, ob es ueberhaupt etwas Neues gibt.</summary>
+    public static async Task UpdateAllAsync(IWin32Window owner, AppState state, GameInstall game)
+    {
+        var pending = state.Mods.Where(m => m.AvailableVersion is not null).ToList();
+        if (pending.Count == 0)
         {
-            MessageBox.Show(owner,
-                "Star Trek Fleet Command is running. Close it completely, then check for updates again.",
-                "Game is running", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(owner, "No updates are pending. Use 'Check updates' first.", "Update all",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
+        var list = string.Join("\r\n", pending.Select(m => $"  {m.Name}: {m.Version} -> {m.AvailableVersion}"));
+        if (MessageBox.Show(owner, "Install these updates now?\r\n\r\n" + list, "Update all",
+                            MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+
+        await InstallPendingUpdatesAsync(owner, state, game);
+    }
+
+    /// <summary>Installiert alle Mods mit gesetzter AvailableVersion -- der gemeinsame
+    /// Installationsteil von CheckUpdatesAsync (nach "Ja, jetzt installieren") und UpdateAllAsync.</summary>
+    private static async Task InstallPendingUpdatesAsync(IWin32Window owner, AppState state, GameInstall game)
+    {
         var installFailed = new List<string>();
+        var skipped = new List<string>();
+        var stoppedForRunningGame = false;
+
         foreach (var mod in state.Mods.Where(m => m.AvailableVersion is not null).ToList())
         {
+            // Fix-Runde 1, I2: einmalig VOR der Schleife geprueft reichte nicht ("die Pruefung ist
+            // an sich richtig platziert, aber nur einmal fuer einen ganzen Stapel ausgewertet") --
+            // jede Iteration macht durch GitHubClient (Netzwerk) und ApplyPackage selbst Zeit
+            // vergehen, in der das Spiel zwischen zwei Mods gestartet werden kann. ApplyPackage
+            // prueft am eigentlichen Schreibpunkt zwar noch einmal (zweite Verteidigungslinie), aber
+            // ohne diese Pruefung HIER wuerde ein spaeter in der Schleife startendes Spiel erst nach
+            // einem bereits begonnenen Download bemerkt, und die Sammelmeldung am Ende erklaerte
+            // nicht, warum der Rest der Liste nie versucht wurde.
+            if (GameLocator.IsGameRunning()) { stoppedForRunningGame = true; break; }
+
             var parsed = GitHubClient.ParseRepoUrl("https://github.com/" + mod.Repo);
             if (parsed is null) continue;
             try
             {
                 var release = await GitHubClient.GetLatestReleaseAsync(
                     parsed.Value.Owner, parsed.Value.Repo, null, state.GitHubToken, CancellationToken.None);
-                if (release is null) continue;
+                if (release is null)
+                {
+                    // Cheap Fix: vorher ein stilles "continue" -- der Nutzer sah nie, dass und warum
+                    // ein angekuendigtes Update nicht installiert wurde.
+                    skipped.Add($"{mod.Name}: GitHub returned nothing to install");
+                    continue;
+                }
 
-                var name = GitHubClient.PickAsset(release.Assets.Select(a => a.Name).ToList(), mod.AssetName);
-                if (name is null) continue;
+                var names = release.Assets.Select(a => a.Name).ToList();
+                // Fix-Runde 1, I3: dieselbe Regel wie im interaktiven Pfad (s. AddFromGitHub).
+                if (GitHubClient.InstallableCandidates(names).Count == 0)
+                {
+                    skipped.Add($"{mod.Name}: the latest release has no installable file");
+                    mod.AvailableVersion = null;   // ein erneuter Versuch traefe auf dieselbe Sackgasse
+                    continue;
+                }
 
-                InstallFromGitHub(owner, state, game, mod.Repo!, release,
-                                  release.Assets.First(a => a.Name == name));
+                var name = GitHubClient.PickAsset(names, mod.AssetName);
+                if (name is null)
+                {
+                    skipped.Add($"{mod.Name}: multiple files could not be told apart automatically -- " +
+                                "use 'Update' from the right-click menu to choose one");
+                    mod.AvailableVersion = null;
+                    continue;
+                }
+
+                var applied = InstallFromGitHub(owner, state, game, mod.Repo!, release,
+                                                release.Assets.First(a => a.Name == name));
+                // Cheap Fix: ApplyPackage lehnt ein Paket (z. B. "kein Plugin gefunden") ohne eigene
+                // Ausnahme ab -- ohne diese Zeile blieb AvailableVersion stehen und jeder kuenftige
+                // "Update all"-Lauf haette denselben Download nur wiederholt, um an derselben Stelle
+                // erneut abgelehnt zu werden, ohne dass der Nutzer je erfuhr, warum nichts passiert.
+                if (!applied) mod.AvailableVersion = null;
             }
             // Wie in AddFromGitHub: InstallFromGitHub ruft nach dem Download Installer.Sha256File auf
             // rohem Dateisystemzugriff auf, deshalb hier zusaetzlich zu den Netzwerk-Ausnahmen auch
@@ -419,14 +540,96 @@ public static class Dialogs
             {
                 AppLog.Error($"update failed for {mod.Repo}", e);
                 installFailed.Add(mod.Name);
+                // Cheap Fix: derselbe Grund wie oben -- ohne diese Zeile haette der naechste
+                // Update-Lauf denselben (womoeglich dauerhaften) Fehlschlag stillschweigend
+                // wiederholt. Ein transientes Problem (kurzzeitig gesperrte Datei) verliert dadurch
+                // seine "update to X"-Anzeige bis zum naechsten "Check updates" -- das ist der
+                // bewusst in Kauf genommene, kleinere Nachteil gegenueber einer fuer immer falschen
+                // Statusspalte.
+                mod.AvailableVersion = null;
             }
         }
 
+        state.Save();
+
+        var messages = new List<string>();
+        if (stoppedForRunningGame)
+            messages.Add("Star Trek Fleet Command started running during the update -- the remaining updates were skipped.");
         if (installFailed.Count > 0)
+            messages.Add("Some updates could not be installed:\r\n" + string.Join("\r\n", installFailed));
+        if (skipped.Count > 0)
+            messages.Add("Some updates were skipped:\r\n" + string.Join("\r\n", skipped));
+
+        if (messages.Count > 0)
+            MessageBox.Show(owner, string.Join("\r\n\r\n", messages) + "\r\n\r\nSee the log for details.",
+                            "Check updates", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    }
+
+    /// <summary>Spec §12: "Update" im Kontextmenue fuer genau einen Mod -- prueft und installiert,
+    /// ohne den ganzen Bestand anzufassen. Zeigt (anders als der Stapelweg in
+    /// InstallPendingUpdatesAsync) bei Mehrdeutigkeit den Auswahldialog statt nur zu ueberspringen,
+    /// weil hier ohnehin nur ein einziger Mod im Spiel ist -- fuer genau den Fall, den der Stapelweg
+    /// per "use 'Update' from the right-click menu" an diese Stelle verweist.</summary>
+    public static async Task UpdateSingleAsync(IWin32Window owner, AppState state, GameInstall game, ModEntry mod)
+    {
+        if (mod.Repo is null) return;
+        var parsed = GitHubClient.ParseRepoUrl("https://github.com/" + mod.Repo);
+        if (parsed is null) return;
+
+        ReleaseInfo? release;
+        try
+        {
+            release = await GitHubClient.GetLatestReleaseAsync(
+                parsed.Value.Owner, parsed.Value.Repo, null, state.GitHubToken, CancellationToken.None);
+        }
+        catch (Exception e) when (e is HttpRequestException or InvalidOperationException or TaskCanceledException)
+        {
+            AppLog.Error($"update failed for {mod.Repo}", e);
             MessageBox.Show(owner,
-                "Some updates could not be installed:\r\n" + string.Join("\r\n", installFailed) +
-                "\r\n\r\nSee the log for details.",
-                "Check updates", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                SafeUserMessage(e, "Could not check for an update. Check your internet connection and try again."),
+                "Update", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        if (release is null)
+        {
+            MessageBox.Show(owner, $"{mod.Name} is already up to date.", "Update",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var latest = release.Tag.TrimStart('v', 'V');
+        if (latest == mod.Version)
+        {
+            MessageBox.Show(owner, $"{mod.Name} is already up to date ({mod.Version}).", "Update",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var names = release.Assets.Select(a => a.Name).ToList();
+        var candidates = GitHubClient.InstallableCandidates(names);
+        if (candidates.Count == 0)
+        {
+            MessageBox.Show(owner, "The latest release has no installable .zip or .dll file.", "Update",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var chosen = GitHubClient.PickAsset(names, mod.AssetName)
+                  ?? ChooseFromList(owner, "Which file should be installed?", candidates);
+        if (chosen is null) return;
+
+        // Fix-Runde 1, I2: derselbe Grund wie ueberall sonst -- die Netzwerkabfrage plus ein
+        // moeglicher Auswahldialog oben lagen zwischen dem letzten Guard() in MainForm und hier.
+        if (GameLocator.IsGameRunning())
+        {
+            MessageBox.Show(owner,
+                "Star Trek Fleet Command is running. Close it completely, then try again.",
+                "Game is running", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        InstallFromGitHub(owner, state, game, mod.Repo, release, release.Assets.First(a => a.Name == chosen));
     }
 
     public static void SetUpdateSource(IWin32Window owner, AppState state, ModEntry mod, Action onDone)
@@ -486,6 +689,9 @@ public static class Dialogs
 
         Exception? failure = null;
         var cancelled = false;
+        // Fix-Runde 1, I4: getrennt von "cancelled"/"failure" -- die einzige Frage, die FormClosing
+        // braucht, ist "darf dieses Schliessen durch", nicht warum die Aktion endete.
+        var finished = false;
 
         // form.Shown statt den Download vor ShowDialog() zu starten: ShowDialog() blockiert den
         // Aufrufer, bis der Dialog geschlossen wird -- der Download muss also aus dem Dialog HERAUS
@@ -520,8 +726,28 @@ public static class Dialogs
             }
             finally
             {
+                finished = true;
                 form.Close();
             }
+        };
+
+        // Fix-Runde 1, I4 (wichtig): Alt+F4 sendet WM_SYSCOMMAND/SC_CLOSE, das ShowDialog() auch bei
+        // ControlBox = false sofort beendet -- reproduziert. Ohne diesen Handler kehrte ShowDialog()
+        // sofort zurueck, WAEHREND BepInExRuntime.InstallAsync im Hintergrund weiter in den
+        // Spielordner schreibt: weder "failure" noch "cancelled" wurden je gesetzt, der Nutzer sah
+        // "BepInEx was installed" mitten in einem noch laufenden Schreibvorgang, RefreshUi meldete
+        // gleich danach "not installed", und ein spaeterer Fehlschlag landete in einer Variable, die
+        // niemand mehr liest. Der Handler bricht die Operation genauso ab wie der Cancel-Knopf, laesst
+        // den Dialog aber offen, bis der Hintergrund-Task tatsaechlich fertig ist (erkennbar an
+        // "finished", das der finally-Block oben setzt, bevor er form.Close() SELBST aufruft) -- erst
+        // dieses zweite, programmatische Close() darf durch.
+        form.FormClosing += (_, e) =>
+        {
+            if (finished) return;                    // echtes Ende: durchlassen
+            e.Cancel = true;
+            status.Text = "Cancelling…";
+            cancel.Enabled = false;
+            cts.Cancel();
         };
 
         form.ShowDialog(owner);

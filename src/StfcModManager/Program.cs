@@ -62,9 +62,40 @@ internal static partial class Program
         Core.SelfUpdate.CleanupOldExecutable();
         Core.Installer.PruneBackups();
 
+        // Fix-Runde 1, I8: ohne einen registrierten Handler zeigt WinForms fuer jede aus einem
+        // Ereignishandler entkommende Ausnahme seinen eigenen Standarddialog -- roher Text plus
+        // Stacktrace, genau das, was die Regel "keine Betriebssystem-/Ausnahmetexte vor dem Nutzer"
+        // verbietet, und die Stelle, an der die Spec-Zeile "Unexpected error -- see support package"
+        // sonst nirgends existiert. SetUnhandledExceptionMode muss VOR Application.Run stehen, sonst
+        // greift der eingebaute .NET-Standard (in .NET Core/5+ anders als unter .NET Framework:
+        // ThrowException statt CatchException) weiter. Zwei Handler, weil zwei verschiedene Faelle
+        // entkommen koennen: Application.ThreadException faengt alles, was synchron aus einem
+        // normal aufgerufenen Ereignishandler entkommt (z. B. Sha256File auf einer gesperrten DLL
+        // waehrend Rescan, ein weiterwerfendes AppState.Save, Process.Start's Win32Exception in
+        // "Open config" oder beim Support-Paket-Reveal) -- AppDomain.UnhandledException zusaetzlich
+        // fuer eine Ausnahme aus einem async-void-Ereignishandler (z. B. OnCheckUpdates), die dort
+        // nicht mehr ankommt; der Prozess beendet sich danach trotzdem (dafuer gibt es in .NET keinen
+        // Ausweg), aber der Nutzer sieht wenigstens eine erklaerende Meldung statt eines
+        // kommentarlosen Absturzes, und die Einzelheiten stehen im Log.
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, e) => HandleUnhandledException(e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            HandleUnhandledException(e.ExceptionObject as Exception ?? new Exception(e.ExceptionObject.ToString()));
+
         ApplicationConfiguration.Initialize();
         Application.Run(new Ui.MainForm());
         return 0;
+    }
+
+    /// <summary>Letztes Auffangnetz (s. Aufrufer-Kommentar): protokolliert die volle Ausnahme und
+    /// zeigt dem Nutzer nur eine feste, englische, betriebssystemfreie Zeile -- dieselbe Regel wie
+    /// ueberall sonst in der Ui-Schicht, hier nur fuer den Fall, dass irgendetwas sie umgangen hat.</summary>
+    private static void HandleUnhandledException(Exception e)
+    {
+        Core.AppLog.Error("unhandled exception reached the UI message loop", e);
+        MessageBox.Show(
+            "An unexpected error occurred. Generate a support package and check the manager log for details.",
+            "Unexpected error", MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 
     /// <summary>Normalfall: Timeout 0, exakt das Verhalten von "new Mutex(true, name, out

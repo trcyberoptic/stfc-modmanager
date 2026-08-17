@@ -922,6 +922,25 @@ internal static class SelfTest
            MainForm.NativeModAction.UpdateEnabled,
            "native-action: present and an entry already exists -- just refresh Enabled");
 
+        // --- MainForm.DecidePluginReconcileAction (Fix-Runde 1, I6) -- reine Zustandsuebergangs-
+        // Logik fuer den Abgleich eines bereits bekannten Plugin-Mods mit der Platte, getrennt von
+        // den beiden File.Exists-Aufrufen (ReconcilePluginFiles), damit sie ohne Dateisystem
+        // pruefbar ist. Alle vier Faelle der Wahrheitstabelle einzeln gepinnt, inklusive des seltenen
+        // Falls, dass die Datei an BEIDEN Orten gleichzeitig liegt (z. B. von Hand kopiert) -- dort
+        // gewinnt bewusst der aktivierte Ort, statt den Fall unbehandelt zu lassen.
+        Eq(MainForm.DecidePluginReconcileAction(existsEnabled: true, existsDisabled: false),
+           MainForm.PluginReconcileAction.SetEnabled,
+           "plugin-reconcile: file only at the enabled location -- Enabled must become true");
+        Eq(MainForm.DecidePluginReconcileAction(existsEnabled: false, existsDisabled: true),
+           MainForm.PluginReconcileAction.SetDisabled,
+           "plugin-reconcile: file only at the disabled location -- Enabled must become false");
+        Eq(MainForm.DecidePluginReconcileAction(existsEnabled: false, existsDisabled: false),
+           MainForm.PluginReconcileAction.Missing,
+           "plugin-reconcile: file at neither location -- surfaced as missing, not silently left enabled");
+        Eq(MainForm.DecidePluginReconcileAction(existsEnabled: true, existsDisabled: true),
+           MainForm.PluginReconcileAction.SetEnabled,
+           "plugin-reconcile: file at both locations at once -- the enabled location wins the tie");
+
         FileSystemChecks();
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
