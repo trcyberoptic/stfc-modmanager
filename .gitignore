@@ -1,6 +1,7 @@
 # Build output
 bin/
 obj/
+publish/
 
 # Local mod drop folder (user content, not source)
 LocalMods/

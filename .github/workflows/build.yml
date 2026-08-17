@@ -1,0 +1,91 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write   # needed by softprops/action-gh-release to attach the exe to a tagged release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build
+        run: dotnet build src/StfcModManager/StfcModManager.csproj -c Release
+
+      - name: Self-test
+        shell: pwsh
+        run: |
+          $output = & dotnet run --project src/StfcModManager/StfcModManager.csproj -c Release -- --selftest 2>&1
+          $exitCode = $LASTEXITCODE
+          $outputText = $output | Out-String
+          Write-Host $outputText
+
+          # Why this step does more than check $exitCode:
+          #
+          # SelfTest.cs runs a large batch of pure logic asserts, then a second batch of
+          # filesystem-backed asserts (FileSystemChecks) that actually create a throwaway
+          # folder under the OS temp directory and exercise the real installer/extractor code
+          # against it -- the only part of the suite that reaches the delete/move/rollback
+          # code paths at all (the pure asserts above it never touch disk). If that temp
+          # directory is ever unwritable, FileSystemChecks prints "filesystem checks skipped:
+          # no writable temp directory" and returns immediately -- the process still exits 0,
+          # because every assert that DID run still passed, just far fewer of them ran. A bare
+          # exit-code check would call that a green build and silently stop running the entire
+          # filesystem/installer regression suite on CI without anyone noticing. So this step
+          # asserts the printed "<passed> passed, <failed> failed" line explicitly, on top of
+          # the exit code, and separately fails if the skip message shows up at all.
+
+          if ($outputText -match 'filesystem checks skipped') {
+            Write-Error "Self-test skipped its filesystem checks (no writable temp directory on this runner). That means the installer/extractor regression suite did not run at all -- failing the build instead of letting this go by as a silent green."
+            exit 1
+          }
+
+          if ($outputText -notmatch '(\d+) passed, (\d+) failed') {
+            Write-Error "Self-test output did not contain the expected '<N> passed, <N> failed' summary line -- cannot verify how much of the suite actually ran."
+            exit 1
+          }
+
+          $passedCount = [int]$Matches[1]
+          $failedCount = [int]$Matches[2]
+
+          # Known passing count as of writing this workflow: 392. This is a floor, not an exact
+          # match, so it never needs bumping when new asserts are added later -- only if the
+          # suite were to shrink or partially fail to run, which is exactly what this check
+          # exists to catch.
+          $minimumExpectedAsserts = 392
+
+          if ($exitCode -ne 0 -or $failedCount -ne 0) {
+            Write-Error "Self-test reported failures (process exit code $exitCode, $failedCount failed assert(s))."
+            exit 1
+          }
+
+          if ($passedCount -lt $minimumExpectedAsserts) {
+            Write-Error "Self-test only reported $passedCount passed assert(s), expected at least $minimumExpectedAsserts. Part of the suite likely did not run."
+            exit 1
+          }
+
+          Write-Host "Self-test OK: $passedCount passed, $failedCount failed (minimum expected: $minimumExpectedAsserts)."
+
+      - name: Publish single file
+        run: dotnet publish src/StfcModManager/StfcModManager.csproj -c Release -o publish
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StfcModManager
+          path: publish/StfcModManager.exe
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: publish/StfcModManager.exe
