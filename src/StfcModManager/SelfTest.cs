@@ -684,6 +684,26 @@ internal static class SelfTest
         Check(BepInExRuntime.IsAllowedRuntimeHost(new Uri("https://builds.bepinex.dev:443/x")),
               "runtime-host: an explicit DEFAULT port is still accepted");
 
+        // --- SelfUpdate.ApplicableUpdateVersion -- reine Update-Entscheidung, getrennt von
+        // CheckAsync's Netzwerkzugriff getestet (dasselbe Muster wie IsAllowedDownloadHost /
+        // IsAllowedRuntimeHost oben). ---
+        Eq(SelfUpdate.ApplicableUpdateVersion("v1.2.3", new Version(1, 0, 0)), new Version(1, 2, 3),
+           "selfupdate: a tag with a leading lowercase 'v' is parsed as a version");
+        Eq(SelfUpdate.ApplicableUpdateVersion("V2.0.0", new Version(1, 0, 0)), new Version(2, 0, 0),
+           "selfupdate: a tag with a leading uppercase 'V' is parsed as a version too");
+        Eq(SelfUpdate.ApplicableUpdateVersion("1.5.0", new Version(1, 0, 0)), new Version(1, 5, 0),
+           "selfupdate: a bare tag without any 'v' prefix still parses");
+        Eq(SelfUpdate.ApplicableUpdateVersion("release-candidate", new Version(1, 0, 0)), null,
+           "selfupdate: a tag that is not a version at all yields no applicable update, not a crash");
+        Eq(SelfUpdate.ApplicableUpdateVersion("vNext", new Version(1, 0, 0)), null,
+           "selfupdate: a 'v'-prefixed tag that still isn't a version after trimming yields no update");
+        Eq(SelfUpdate.ApplicableUpdateVersion("v1.0.0", new Version(1, 0, 0)), null,
+           "selfupdate: a tag equal to the current version is not an update (strictly greater required)");
+        Eq(SelfUpdate.ApplicableUpdateVersion("v0.9.0", new Version(1, 0, 0)), null,
+           "selfupdate: a tag older than the current version is not an update");
+        Eq(SelfUpdate.ApplicableUpdateVersion("v1.0.1", new Version(1, 0, 0)), new Version(1, 0, 1),
+           "selfupdate: a tag one patch version newer applies");
+
         // --- LogReader: BepInEx-Zeilenformat (Task-Brief) ---
         var le = LogReader.ParseLine("[Error  :   Hellebarde] NullReferenceException in AutoTasksTick");
         Eq(le?.Level, "Error", "log: level parsed");
