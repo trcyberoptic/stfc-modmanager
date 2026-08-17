@@ -1,11 +1,20 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text.Json;
 
 namespace StfcModManager.Core;
 
-public sealed record ReleaseAsset(string Name, string DownloadUrl, long Size);
+/// <summary>Digest ist der von GitHubs API veroeffentlichte SHA-256-Hash des Assets ("sha256:&lt;64
+/// Hex-Zeichen&gt;", schon auf den reinen Hex-Teil verkuerzt -- s. ParseSha256Digest), oder null,
+/// wenn GitHub fuer dieses Asset keinen liefert (z. B. ein sehr altes Release, oder ein kuenftiger
+/// API-Wandel). Optional mit Default, damit die bestehende Konstruktionsstelle unten unveraendert
+/// bleibt.</summary>
+public sealed record ReleaseAsset(string Name, string DownloadUrl, long Size, string? Digest = null);
 public sealed record ReleaseInfo(string Tag, IReadOnlyList<ReleaseAsset> Assets, string? ETag);
+
+/// <summary>Ergebnis von GitHubClient.ClassifyDigest -- s. dort.</summary>
+internal enum DigestOutcome { Unverified, Verified, Mismatch }
 
 /// <summary>Einzige Quelle ausgehenden Netzwerkverkehrs der Anwendung. Was hier akzeptiert und
 /// heruntergeladen wird, landet als Plugin im Spielprozess -- jede Pruefung in dieser Datei ist
@@ -82,6 +91,34 @@ public static class GitHubClient
 
     private static bool IsZip(string n) => n.EndsWith(".zip", StringComparison.OrdinalIgnoreCase);
     private static bool IsDll(string n) => n.EndsWith(".dll", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Parst GitHubs "digest"-Asset-Feld ("sha256:&lt;64 Hex-Zeichen&gt;") auf den reinen,
+    /// kleingeschriebenen Hex-Teil, oder liefert null -- fuer ein fehlendes Feld GENAUSO wie fuer
+    /// ein vorhandenes, das nicht sha256 ist oder nicht wie ein 32-Byte-Hash aussieht. Der Aufrufer
+    /// (GetLatestReleaseAsync) behandelt beides identisch: "kein verifizierbarer Digest", keine
+    /// Ablehnung des ganzen Release -- das Feld ist ein Bonus, keine Vertragspflicht der API. Rein
+    /// und ohne JSON/Netzwerk testbar, dasselbe Muster wie IsAllowedDownloadHost.</summary>
+    internal static string? ParseSha256Digest(string? digestField)
+    {
+        if (digestField is null) return null;
+        const string prefix = "sha256:";
+        if (!digestField.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return null;
+
+        var hex = digestField[prefix.Length..];
+        return hex.Length == 64 && hex.All(Uri.IsHexDigit) ? hex.ToLowerInvariant() : null;
+    }
+
+    /// <summary>Reine Klassifikation eines heruntergeladenen Assets gegen GitHubs veroeffentlichten
+    /// Digest, getrennt vom eigentlichen Hashen der Datei (das braucht Netzwerk/Datei-I/O und ist
+    /// hier bewusst NICHT drin) -- dasselbe Muster wie SelfUpdate.ApplicableUpdateVersion. "actual"
+    /// wird nur ausgewertet, wenn "expected" nicht null ist: fehlt der Digest, wird in
+    /// DownloadAssetAsync gar nicht erst gehasht (reine Ersparnis, keine Verhaltensaenderung) --
+    /// Unverified ist dann die Antwort unabhaengig davon, was "actual" waere.</summary>
+    internal static DigestOutcome ClassifyDigest(string? expected, string actual)
+    {
+        if (expected is null) return DigestOutcome.Unverified;
+        return expected.Equals(actual, StringComparison.OrdinalIgnoreCase) ? DigestOutcome.Verified : DigestOutcome.Mismatch;
+    }
 
     /// <summary>Dieselbe .zip/.dll-Regel wie PickAsset, als eigener oeffentlicher Baustein: ein
     /// Aufrufer, der von PickAsset ein null bekommt, kann so selbst unterscheiden, ob es
@@ -292,6 +329,15 @@ public static class GitHubClient
                         var name = a.TryGetProperty("name", out var nameEl) ? nameEl.GetString() : null;
                         var url = a.TryGetProperty("browser_download_url", out var urlEl) ? urlEl.GetString() : null;
 
+                        // ValueKind-Wache statt TryGetProperty allein: digestEl.GetString() wirft
+                        // eine InvalidOperationException, wenn das Feld zwar da ist, aber kein
+                        // String ist (z. B. JSON null oder eine kuenftige, andere Form) -- das darf
+                        // wie ParseSha256Digest selbst nie das ganze Release-Abrufen zu Fall bringen,
+                        // sondern nur "kein Digest fuer dieses Asset" bedeuten.
+                        var digest = a.TryGetProperty("digest", out var digestEl) && digestEl.ValueKind == JsonValueKind.String
+                            ? ParseSha256Digest(digestEl.GetString())
+                            : null;
+
                         long size = 0;
                         if (a.TryGetProperty("size", out var sizeEl) && sizeEl.ValueKind == JsonValueKind.Number)
                         {
@@ -302,7 +348,7 @@ public static class GitHubClient
                                 throw UnexpectedShape("an asset's 'size' is a non-integer number");
                         }
 
-                        if (name is not null && url is not null) assets.Add(new ReleaseAsset(name, url, size));
+                        if (name is not null && url is not null) assets.Add(new ReleaseAsset(name, url, size, digest));
                     }
                 }
 
@@ -465,6 +511,40 @@ public static class GitHubClient
                 File.Delete(tmp);
                 throw new InvalidOperationException(
                     $"Download of {asset.Name} is incomplete ({actualLength} of {expectedLength} bytes). Please try again.");
+            }
+
+            // GitHub veroeffentlicht seit einiger Zeit einen SHA-256-Digest pro Asset (s.
+            // ParseSha256Digest) -- unabhaengig davon, ob dieses Projekt selbst je Checksummen
+            // veroeffentlicht. Vorhanden, wird VOR dem Verschieben an den Zielnamen geprueft: ein
+            // spaeterer Schritt haelt eine Datei unter dem Zielnamen sonst faelschlich fuer
+            // vertrauenswuerdig, ganz gleich ob der Fehler durch Uebertragungsfehler oder durch
+            // Manipulation entstand. Fehlt der Digest (aeltere Releases, ein kuenftiger API-Wandel),
+            // wird das NICHT als Fehlschlag behandelt -- sonst wuerde ein voellig legitimes Release
+            // ohne dieses Feld die Anwendung lahmlegen. Beide Faelle werden protokolliert, damit sich
+            // "kein Digest da" von "Digest gepasst" im Log unterscheiden laesst.
+            if (asset.Digest is not null)
+            {
+                string actualHex;
+                await using (var verifyStream = File.OpenRead(tmp))
+                {
+                    var hashBytes = await SHA256.HashDataAsync(verifyStream, ct).ConfigureAwait(false);
+                    actualHex = Convert.ToHexStringLower(hashBytes);
+                }
+
+                if (ClassifyDigest(asset.Digest, actualHex) == DigestOutcome.Mismatch)
+                {
+                    AppLog.Error($"downloaded {asset.Name} failed SHA-256 verification: GitHub published {asset.Digest}, got {actualHex}");
+                    File.Delete(tmp);
+                    throw new InvalidOperationException(
+                        $"The downloaded file for {asset.Name} does not match the checksum GitHub published for it. " +
+                        "The download was discarded. Try again; if this keeps happening, do not install the file.");
+                }
+
+                AppLog.Info($"downloaded {asset.Name} passed SHA-256 verification against GitHub's published digest");
+            }
+            else
+            {
+                AppLog.Warn($"downloaded {asset.Name} has no published digest from GitHub -- proceeding unverified");
             }
 
             try

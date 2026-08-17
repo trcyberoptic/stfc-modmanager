@@ -704,6 +704,48 @@ internal static class SelfTest
         Eq(SelfUpdate.ApplicableUpdateVersion("v1.0.1", new Version(1, 0, 0)), new Version(1, 0, 1),
            "selfupdate: a tag one patch version newer applies");
 
+        // --- GitHubClient.ParseSha256Digest / ClassifyDigest -- Fix Round 1: GitHub publishes a
+        // SHA-256 digest per release asset ("digest": "sha256:<64 hex chars>"); DownloadAssetAsync
+        // now verifies the download against it before moving the file into place. Both the parsing
+        // and the match/mismatch/absent decision are pure and tested here without any network or
+        // file I/O -- the actual hashing happens only inside DownloadAssetAsync. ---
+        var sampleHex = new string('a', 64);
+        Eq(GitHubClient.ParseSha256Digest($"sha256:{sampleHex}"), sampleHex,
+           "digest: a well-formed \"sha256:<64 hex>\" field parses to the bare hex part");
+        Eq(GitHubClient.ParseSha256Digest($"SHA256:{sampleHex.ToUpperInvariant()}"), sampleHex,
+           "digest: the \"sha256:\" prefix and the hex digits are both matched case-insensitively, normalized to lowercase");
+        Eq(GitHubClient.ParseSha256Digest(null), null,
+           "digest: a missing field (GitHub JSON has no \"digest\" property) yields null, not a throw");
+        // "sha384:" is deliberately the same length (7 chars) as "sha256:" followed by 64 hex
+        // chars, same as a valid case -- unlike a "sha512:"+128-hex payload (rejected by the length
+        // check alone even without a prefix check), this ONLY fails if the prefix is actually
+        // compared, not merely skipped by a fixed offset.
+        Eq(GitHubClient.ParseSha256Digest($"sha384:{sampleHex}"), null,
+           "digest: a non-sha256 algorithm prefix of the same length is rejected, not silently accepted");
+        // Uses only valid hex characters ('a'), just too few of them -- isolates the length check
+        // from the hex-digit check (a non-hex "tooshort" would fail either check, masking which one
+        // actually caught it).
+        Eq(GitHubClient.ParseSha256Digest($"sha256:{new string('a', 10)}"), null,
+           "digest: a value shorter than 64 hex characters after the prefix is rejected");
+        Eq(GitHubClient.ParseSha256Digest($"sha256:{sampleHex}ff"), null,
+           "digest: a value longer than 64 hex characters after the prefix is rejected");
+        Eq(GitHubClient.ParseSha256Digest($"sha256:{new string('g', 64)}"), null,
+           "digest: 64 characters that are not all valid hex digits ('g' is not hex) is rejected");
+        // Same length-matching trick as the sha384 case above: "xxxxxxx" is 7 chars like "sha256:",
+        // followed by 64 valid hex chars -- a prefix check that's skipped rather than compared would
+        // slice this into a passing 64-hex-char result, exposing the missing comparison.
+        Eq(GitHubClient.ParseSha256Digest($"xxxxxxx{sampleHex}"), null,
+           "digest: an entirely non-algorithm-shaped 7-char prefix is rejected, not silently accepted");
+
+        Eq(GitHubClient.ClassifyDigest(null, sampleHex), DigestOutcome.Unverified,
+           "digest-outcome: no published digest at all classifies as Unverified, never Mismatch");
+        Eq(GitHubClient.ClassifyDigest(sampleHex, sampleHex), DigestOutcome.Verified,
+           "digest-outcome: an identical actual hash classifies as Verified");
+        Eq(GitHubClient.ClassifyDigest(sampleHex, sampleHex.ToUpperInvariant()), DigestOutcome.Verified,
+           "digest-outcome: comparison is case-insensitive (GitHub's digest and Convert.ToHexStringLower may differ in case)");
+        Eq(GitHubClient.ClassifyDigest(sampleHex, new string('b', 64)), DigestOutcome.Mismatch,
+           "digest-outcome: a differing actual hash classifies as Mismatch, the case DownloadAssetAsync must refuse on");
+
         // --- LogReader: BepInEx-Zeilenformat (Task-Brief) ---
         var le = LogReader.ParseLine("[Error  :   Hellebarde] NullReferenceException in AutoTasksTick");
         Eq(le?.Level, "Error", "log: level parsed");

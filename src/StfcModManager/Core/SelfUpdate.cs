@@ -1,30 +1,47 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.InteropServices;
 
 namespace StfcModManager.Core;
 
 /// <summary>
-/// Ersetzt die eigene EXE. Eine laufende EXE laesst sich nicht ueberschreiben,
-/// aber umbenennen — daraus besteht der ganze Trick. Kein Hilfsprozess noetig.
+/// Ersetzt die eigene EXE, waehrend sie laeuft. Kein Hilfsprozess noetig.
 ///
-/// Der Trick haelt auch fuer den self-contained Single-File-Host dieses Projekts: der
-/// Windows-Loader oeffnet eine gestartete EXE mit FILE_SHARE_DELETE (aber ohne FILE_SHARE_WRITE) --
-/// direktes Ueberschreiben scheitert deshalb, Umbenennen (das nur den Verzeichniseintrag aendert,
-/// nicht den offenen Datei-Handle) dagegen nicht. Vor dem Schreiben dieser Klasse angenommen, aber
-/// NICHT einfach geglaubt: fuer diesen Build (net10.0-windows, PublishSingleFile +
-/// IncludeNativeLibrariesForSelfExtract=true) mit DOTNET_BUNDLE_EXTRACT_BASE_DIR auf ein leeres
-/// Verzeichnis gemessen, dass zur Laufzeit KEINE Datei dorthin extrahiert wird -- der moderne
-/// Windows-Host laedt seine eigenen nativen Hosting-Komponenten (coreclr.dll usw.) direkt
-/// speicher-gemappt aus der einen gebuendelten EXE, ohne Extraktion auf die Platte. Die laufende EXE
-/// ist damit auf diesem Build tatsaechlich die EINZIGE beteiligte gesperrte Datei, keine zweite
-/// Altlast, die das Umbenennen unterlaufen koennte. Von Hand nachgemessen (publish, EXE starten,
-/// aus einer zweiten Shell umbenennen+ersetzen, DOTNET_BUNDLE_EXTRACT_BASE_DIR-Gegenprobe), s.
-/// Taskbericht.
+/// Fix Round 1: die urspruengliche Loesung war ein Umbenennen+Verschieben in zwei Schritten
+/// (EXE -> .old, dann Nebendatei -> EXE) -- funktionierte, hatte aber ein winziges, unvermeidbares
+/// Zeitfenster dazwischen, in dem unter dem EXE-Namen ueberhaupt keine Datei liegt: ein Prozesstod
+/// genau dort haette die Installation unstartbar zurueckgelassen, ohne dass irgendein Code danach
+/// das haette reparieren koennen. Ersetzt durch EINEN Aufruf von Win32 ReplaceFile: das ist genau
+/// die dafuer vorgesehene API (in-use-Datei atomar ersetzen, mit Sicherung des alten Inhalts) --
+/// kein beobachtbarer Zwischenzustand, kein Hilfsprozess. Handverifiziert an einer echten laufenden
+/// Single-File-EXE (s. Taskbericht Fix Round 1): der Prozess blieb reaktionsfaehig, ExePath trug
+/// hinterher den neuen Inhalt, OldPath den alten.
+///
+/// Die vom Host beim ersten Start extrahierten nativen Bibliotheken sind hier ohnehin kein Thema:
+/// fuer diesen Build (net10.0-windows, PublishSingleFile + IncludeNativeLibrariesForSelfExtract=true)
+/// mit DOTNET_BUNDLE_EXTRACT_BASE_DIR auf ein leeres Verzeichnis gemessen, dass zur Laufzeit KEINE
+/// Datei dorthin extrahiert wird -- der moderne Windows-Host laedt seine eigenen nativen
+/// Hosting-Komponenten (coreclr.dll usw.) direkt speicher-gemappt aus der einen gebuendelten EXE.
+/// Die laufende EXE ist damit die EINZIGE beteiligte gesperrte Datei.
 /// </summary>
-public static class SelfUpdate
+public static partial class SelfUpdate
 {
     public const string RepoOwner = "trcyberoptic";
     public const string RepoName = "stfc-modmanager";
+
+    // ReplaceFileW: ersetzt lpReplacedFileName durch lpReplacementFileName in einem Kernel-Aufruf
+    // und sichert dessen bisherigen Inhalt (falls angegeben) unter lpBackupFileName -- selbst wenn
+    // lpReplacedFileName gerade als laufendes Prozess-Image geoeffnet ist (handverifiziert, s.
+    // Klassenkommentar). lpExclude/lpReserved sind reserviert und muessen 0 sein.
+    [LibraryImport("kernel32.dll", EntryPoint = "ReplaceFileW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool ReplaceFile(
+        string lpReplacedFileName,
+        string lpReplacementFileName,
+        string lpBackupFileName,
+        uint dwReplaceFlags,
+        nint lpExclude,
+        nint lpReserved);
 
     private static string ExePath => Environment.ProcessPath
         ?? throw new InvalidOperationException("cannot determine own executable path");
@@ -94,57 +111,27 @@ public static class SelfUpdate
                 "move it to a writable folder and try again.", e);
         }
 
-        // Vorherigen Rest aufraeumen, damit der folgende Move nicht an einer bereits vorhandenen
-        // OldPath scheitert (File.Move ohne overwrite wirft, wenn das Ziel schon existiert).
+        // Vorherigen Rest aufraeumen (best effort): ReplaceFile ueberschreibt eine bereits
+        // vorhandene Sicherungsdatei zwar selbst, ein sauberer Ausgangszustand schadet trotzdem
+        // nicht.
         CleanupOldExecutable();
 
-        // Schritt 2, der Punkt ohne Rueckweg: die laufende EXE umbenennen. Erlaubt, auch waehrend
-        // der Prozess laeuft (s. Klassenkommentar). Schlaegt DAS schon fehl, ist wiederum nichts
-        // Zerstoerendes passiert -- die EXE heisst noch, wie sie immer hiess.
-        try
+        // Der Punkt ohne Rueckweg -- aber ohne das Zwischenfenster, das ein Umbenennen+Verschieben
+        // in zwei Schritten zwangslaeufig haette (s. Klassenkommentar): EIN Kernel-Aufruf ersetzt
+        // die laufende EXE durch die Nebendatei und sichert deren alten Inhalt unter OldPath. Es
+        // gibt keinen Moment, in dem unter dem EXE-Namen keine Datei liegt -- entweder der Aufruf
+        // gelingt vollstaendig, oder ExePath ist unveraendert die alte Datei. Ein Doppel-Rollback
+        // wie bei der frueheren Zwei-Schritt-Loesung ist deshalb unnoetig und entfaellt: ein
+        // Fehlschlag hier laesst die bestehende Installation per Definition unberuehrt.
+        if (!ReplaceFile(ExePath, staged, OldPath, dwReplaceFlags: 0, lpExclude: 0, lpReserved: 0))
         {
-            File.Move(ExePath, OldPath);
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            AppLog.Error($"self-update: could not rename running executable {ExePath}", e);
+            var error = Marshal.GetLastWin32Error();
+            AppLog.Error($"self-update: ReplaceFile failed for {ExePath} (Win32 error {error})");
             try { File.Delete(staged); } catch (Exception ce) when (ce is IOException or UnauthorizedAccessException) { }
             throw new InvalidOperationException(
-                $"Could not update {Path.GetFileName(ExePath)}: the running file could not be renamed. " +
-                "Check that the application is not installed in a protected, read-only location.", e);
-        }
-
-        // Schritt 3: die Nebendatei an den freigewordenen Namen verschieben. Schlaegt GENAU DAS
-        // fehl, stuende die Anwendung ohne EXE da -- weder die alte noch die neue Version waere
-        // unter dem erwarteten Namen vorhanden, eine Verknuepfung faende nichts mehr zum Starten.
-        // Deshalb hier sofort zurueckrollen, statt den Nutzer damit alleinzulassen.
-        try
-        {
-            File.Move(staged, ExePath);
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            AppLog.Error("self-update: could not move the staged file into place, rolling back", e);
-            try
-            {
-                File.Move(OldPath, ExePath);
-                AppLog.Warn("self-update: rolled back to the previous executable after a failed move");
-            }
-            catch (Exception re) when (re is IOException or UnauthorizedAccessException)
-            {
-                // Der seltene Doppel-Fehlschlag: nicht einmal der Rueckbau gelingt. Dann liegt
-                // wirklich keine EXE mehr unter dem erwarteten Namen -- das darf nicht
-                // stillschweigend untergehen, der Nutzer braucht die Handlungsanweisung, die alte
-                // Version von Hand zurueckzubenennen.
-                AppLog.Error($"self-update: rollback ALSO failed -- {ExePath} is missing, previous version is at {OldPath}", re);
-                throw new InvalidOperationException(
-                    $"The update failed and the automatic rollback could not restore the previous version. " +
-                    $"The previous executable is still at '{OldPath}' -- rename it back to " +
-                    $"'{Path.GetFileName(ExePath)}' manually.", re);
-            }
-            throw new InvalidOperationException(
-                $"Could not finish updating {Path.GetFileName(ExePath)}. The previous version was restored, " +
-                "nothing was lost. Try the update again later.", e);
+                $"Could not update {Path.GetFileName(ExePath)}: the running file could not be replaced. " +
+                "Check that the application is not installed in a protected, read-only location, and that " +
+                "no other program (e.g. an antivirus scanner) has it locked. Nothing was changed.");
         }
 
         AppLog.Info($"self-update applied, restarting into {asset.Name}");
