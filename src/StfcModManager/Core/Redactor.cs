@@ -12,9 +12,10 @@ public static partial class Redactor
 {
     // Die Schluesselwoerter selbst, EINMAL definiert und in Left/Right/SecretAssignment
     // wiederverwendet (s. dort) -- zwei unabhaengig gepflegte Listen wuerden ueber Zeit
-    // auseinanderlaufen. "pw" und "passwd" (Fix-Runde 1, I3) sind gaengige Kurzformen von
-    // "password", die sonst unredigiert durchgingen.
-    private const string Keywords = "key|token|secret|password|passwd|pw|passwort|api|auth|authorization";
+    // auseinanderlaufen. "pw" und "passwd" (Fix-Runde 1, I3) sowie "pwd" (Fix-Runde 2, billig
+    // mitgezogen -- dieselbe Fehlerklasse, ein einziges zusaetzliches Wort) sind gaengige Kurzformen
+    // von "password", die sonst unredigiert durchgingen.
+    private const string Keywords = "key|token|secret|password|passwd|pwd|pw|passwort|api|auth|authorization";
 
     // Bezeichner-Grenze fuer zusammengesetzte Namen (PascalCase "ApiKey", snake_case "deepl_api_key").
     // Ein blosses \b reicht NICHT: \w schliesst den Unterstrich ein, also gibt es innerhalb von
@@ -54,12 +55,24 @@ public static partial class Redactor
     // KeyNotFoundException: The given key was not present..." und Stacktraces wie
     // "...AuthTokenManager.cs:line 42" wurden so bis zur Unbrauchbarkeit verstuemmelt, obwohl in
     // ihnen gar keine Zuweisung steht -- genau die Information, fuer die ein Supportpaket ueberhaupt
-    // existiert. Jetzt duerfen zwischen dem Schluesselwort und dem eigentlichen Trenner nur noch
-    // Leerzeichen/Tabs stehen (hoechstens acht, als zusaetzliche Vorsichtsgrenze) -- reicht fuer
-    // "ApiKey    = ..." oder "DeeplApiKey = ...", nicht aber fuer beliebigen Fliesstext. Am echten
-    // .NET-Regex-Modul mit genau den beiden Beispielen oben gegengeprueft (s. Taskbericht).
+    // existiert. Deshalb duerfen zwischen dem Schluesselwort und dem eigentlichen Trenner nur noch
+    // Leerzeichen/Tabs stehen (hoechstens acht, als zusaetzliche Vorsichtsgrenze).
+    //
+    // Fix-Runde 2: ein einzelnes optionales Anfuehrungszeichen VOR den Leerzeichen/Tabs -- die genau
+    // dieselbe Ursache hatte die C1-Korrektur ihrerseits zu eng gemacht: eine im UniversalTranslator
+    // selbst dokumentierte Realitaet, JSON-Anfrage-/Antwortkoerper landen bei aktiviertem Debug-
+    // Logging woertlich im LogOutput.log/Player.log, und dort steht zwischen dem Schluesselnamen und
+    // dem Doppelpunkt ein schliessendes '"' -- "apiKey": "wert", {"apiKey":"wert"} und
+    // "apiKey" : "wert" wurden ohne diese Ergaenzung KOMPLETT unredigiert durchgereicht (ein 16
+    // Zeichen langer Wert liegt unter der 24-Zeichen-Schwelle von LongId, das Auffangnetz greift
+    // hier also nicht). Das Anfuehrungszeichen ist bewusst nur EIN optionales Zeichen, kein
+    // Freibrief fuer beliebige Satzzeichen -- es oeffnet keine neue Luecke fuer Fliesstext, weil ein
+    // Buchstabe (wie in "KeyNotFoundException") weiterhin nicht dazu passt und die Pruefung an genau
+    // derselben Stelle scheitert wie zuvor. Am echten .NET-Regex-Modul mit dem vollstaendigen
+    // Ueberlebens-Korpus aus Fix-Runde 1 UND allen drei JSON-Schreibweisen gegengeprueft, bevor diese
+    // Fassung geschrieben wurde (s. Taskbericht).
     [GeneratedRegex(@"^(?<head>[^=:\r\n]*" + Left + "(?:" + Keywords + ")" + Right
-                   + @"[ \t]{0,8})(?<sep>\s*[=:]\s*)(?<val>\S.*)$",
+                   + "[\"']?" + @"[ \t]{0,8})(?<sep>\s*[=:]\s*)(?<val>\S.*)$",
                     RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex SecretAssignment();
 

@@ -829,6 +829,35 @@ internal static class SelfTest
         Eq(Redactor.RedactLine(versionedPhrase), versionedPhrase,
            "redact: a hyphenated phrase containing a short digit segment ('10') is not mistaken for an opaque token");
 
+        // --- Redactor: Fix-Runde 2 -- die Fix-Runde-1-Korrektur fuer C1 (Leerzeichen/Tabs-only
+        // zwischen Schluesselwort und Trenner) machte SecretAssignment blind fuer JSON-Schreibweisen:
+        // ein schliessendes '"' zwischen dem Schluesselnamen und dem Doppelpunkt passte nicht mehr in
+        // die Luecke. Real relevant: genau der Mod, fuer den diese Klasse geschrieben wurde
+        // (UniversalTranslator), protokolliert JSON-Anfrage-/Antwortkoerper bei aktiviertem Debug-
+        // Logging woertlich in LogOutput.log/Player.log -- ein durchaus realistischer Weg fuer einen
+        // DeepL-Schluessel ins Supportpaket. Alle drei Schreibweisen gepinnt: mit Leerzeichen nach
+        // dem Doppelpunkt (das Beispiel aus dem Fund), kompakt ohne jedes Leerzeichen, und mit
+        // Leerzeichen auf BEIDEN Seiten des Doppelpunkts.
+        Eq(Redactor.RedactLine("\"apiKey\": \"secretvalue123456\""), "\"apiKey\": [REDACTED]",
+           "redact: JSON key/value with a space after the colon");
+        Eq(Redactor.RedactLine("{\"apiKey\":\"secretvalue123456\"}"), "{\"apiKey\":[REDACTED]",
+           "redact: compact JSON key/value with no spaces at all");
+        Eq(Redactor.RedactLine("\"apiKey\" : \"secretvalue123456\""), "\"apiKey\" : [REDACTED]",
+           "redact: JSON key/value with a space on both sides of the colon");
+
+        // --- Redactor: Fix-Runde 2 -- "Pwd"/"PWD" folded in alongside the JSON fix (same class as
+        // Fix-Runde 1's "pw"/"passwd", one more keyword, cheap to add). ---
+        Eq(Redactor.RedactLine("Pwd = hunter2"), "Pwd = [REDACTED]", "redact: the 'Pwd' alias for password");
+        Eq(Redactor.RedactLine("PWD = hunter2"), "PWD = [REDACTED]", "redact: the all-caps 'PWD' alias for password");
+
+        // --- Redactor: Fix-Runde 2 -- re-confirms the exact Fix-Runde-1 C1 survival examples are
+        // NOT reopened by the quote-gap addition. A letter (as in "KeyNotFoundException") still does
+        // not fit the gap, only an optional quote plus whitespace does. ---
+        Eq(Redactor.RedactLine(keyNotFound), keyNotFound,
+           "redact: fix round 2 does not reopen C1 -- KeyNotFoundException still survives untouched");
+        Eq(Redactor.RedactLine(authStackFrame), authStackFrame,
+           "redact: fix round 2 does not reopen C1 -- the drive-letter stack frame still survives untouched");
+
         FileSystemChecks();
 
         Console.WriteLine($"{_passed} passed, {_failed} failed");
