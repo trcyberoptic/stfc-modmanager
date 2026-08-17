@@ -63,7 +63,7 @@ internal static partial class Program
         Core.Installer.PruneBackups();
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new Form { Text = MainWindowTitle, Width = 900, Height = 600 });
+        Application.Run(new Ui.MainForm());
         return 0;
     }
 

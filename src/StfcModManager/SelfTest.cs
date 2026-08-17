@@ -2,6 +2,7 @@ namespace StfcModManager;
 
 using System.IO.Compression;
 using StfcModManager.Core;
+using StfcModManager.Ui;
 
 /// <summary>
 /// Assert-basierter Selbsttest. Bewusst kein Test-Framework: geprüft werden nur
@@ -899,6 +900,27 @@ internal static class SelfTest
            "redact: fix round 2 does not reopen C1 -- KeyNotFoundException still survives untouched");
         Eq(Redactor.RedactLine(authStackFrame), authStackFrame,
            "redact: fix round 2 does not reopen C1 -- the drive-letter stack frame still survives untouched");
+
+        // --- MainForm.DecideNativeModAction (Task 12/13 report) -- reine Zustandsuebergangs-Logik
+        // fuer den nativen Mod-Eintrag, extrahiert aus AdoptFromDisk, damit sie ohne Dateisystem
+        // pruefbar ist. Pinnt die im Taskauftrag geforderte Korrektur: der urspruengliche Drei-
+        // Zweige-Entwurf hatte einen unerreichbaren dritten Zweig ("!nativePresent &&
+        // nativeEntry is not null" kam nie dran, weil der zweite Zweig "nativeEntry is not null"
+        // schon jeden Fall mit vorhandenem Eintrag abfing) -- ein geloeschtes version.dll UND
+        // version.dll_ liess den Eintrag deshalb fuer immer in state.Mods stehen. Alle vier Faelle
+        // der Wahrheitstabelle werden hier einzeln gepinnt.
+        Eq(MainForm.DecideNativeModAction(nativePresent: false, hasExistingEntry: false),
+           MainForm.NativeModAction.None,
+           "native-action: nothing present, no entry -- nothing to do");
+        Eq(MainForm.DecideNativeModAction(nativePresent: false, hasExistingEntry: true),
+           MainForm.NativeModAction.Remove,
+           "native-action: neither version.dll nor version.dll_ present, but an entry still exists -- remove it (the fixed unreachable-branch case)");
+        Eq(MainForm.DecideNativeModAction(nativePresent: true, hasExistingEntry: false),
+           MainForm.NativeModAction.Add,
+           "native-action: version.dll or version.dll_ present, no entry yet -- add one");
+        Eq(MainForm.DecideNativeModAction(nativePresent: true, hasExistingEntry: true),
+           MainForm.NativeModAction.UpdateEnabled,
+           "native-action: present and an entry already exists -- just refresh Enabled");
 
         FileSystemChecks();
 
