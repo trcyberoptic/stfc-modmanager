@@ -10,7 +10,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>StfcModManager</RootNamespace>
     <AssemblyName>StfcModManager</AssemblyName>
-    <Version>0.1.1</Version>
+    <Version>0.1.2</Version>
     <InvariantGlobalization>true</InvariantGlobalization>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
