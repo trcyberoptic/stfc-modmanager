@@ -8,20 +8,65 @@ public static class Dialogs
 {
     // ---------- kleine generische Bausteine ----------
 
-    private static string? Prompt(IWin32Window owner, string title, string label, string initial = "")
+    /// <summary>
+    /// Huelle fuer die selbstgebauten Dialoge: eine Tabelle, die sich nach ihrem Inhalt bemisst,
+    /// in einem Fenster, das sich nach der Tabelle bemisst. Feste Pixelhoehen standen hier dreimal
+    /// und waren dreimal zu klein -- bei zweizeiligem Text, bei groesserer Schrift und auf hoher
+    /// DPI schnitten sie die Schaltflaechenzeile unten ab. Die Breite bleibt vorgegeben, die war
+    /// nie das Problem.
+    /// </summary>
+    private static (Form Form, TableLayoutPanel Body) DialogShell(string title, int contentWidth, bool controlBox = true)
     {
-        using var form = new Form
+        var form = new Form
         {
-            Text = title, Width = 560, Height = 170,
+            Text = title,
             FormBorderStyle = FormBorderStyle.FixedDialog,
             StartPosition = FormStartPosition.CenterParent,
-            MinimizeBox = false, MaximizeBox = false
+            MinimizeBox = false, MaximizeBox = false, ControlBox = controlBox,
+            AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink
         };
-        var text = new Label { Text = label, Left = 12, Top = 12, Width = 520 };
-        var box = new TextBox { Left = 12, Top = 40, Width = 520, Text = initial };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Left = 356, Top = 76, Width = 80 };
-        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 452, Top = 76, Width = 80 };
-        form.Controls.AddRange([text, box, ok, cancel]);
+        var body = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill, ColumnCount = 1,
+            AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Padding = new Padding(12)
+        };
+        body.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, contentWidth));
+        form.Controls.Add(body);
+        return (form, body);
+    }
+
+    /// <summary>Schaltflaechenzeile, rechtsbuendig. Rechts-nach-links-Fluss heisst: das zuerst
+    /// hinzugefuegte Element sitzt ganz rechts -- also Cancel zuerst, damit OK links davon steht.</summary>
+    private static FlowLayoutPanel ButtonRow(params Button[] buttons)
+    {
+        var row = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, WrapContents = false,
+            AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Margin = new Padding(0, 10, 0, 0)
+        };
+        foreach (var b in buttons)
+        {
+            b.AutoSize = true;
+            b.MinimumSize = new Size(80, 0);
+            row.Controls.Add(b);
+        }
+        return row;
+    }
+
+    private static string? Prompt(IWin32Window owner, string title, string label, string initial = "")
+    {
+        const int contentWidth = 520;
+        var (form, body) = DialogShell(title, contentWidth);
+        using var _ = form;
+        var text = new Label { Text = label, AutoSize = true, MaximumSize = new Size(contentWidth, 0) };
+        var box = new TextBox { Text = initial, Width = contentWidth, Margin = new Padding(0, 6, 0, 0) };
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel };
+        body.Controls.Add(text);
+        body.Controls.Add(box);
+        body.Controls.Add(ButtonRow(cancel, ok));
         form.AcceptButton = ok;
         form.CancelButton = cancel;
         return form.ShowDialog(owner) == DialogResult.OK && box.Text.Trim().Length > 0 ? box.Text.Trim() : null;
@@ -29,20 +74,18 @@ public static class Dialogs
 
     private static string? ChooseFromList(IWin32Window owner, string title, IReadOnlyList<string> options)
     {
-        using var form = new Form
-        {
-            Text = title, Width = 480, Height = 320,
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MinimizeBox = false, MaximizeBox = false
-        };
-        var list = new ListBox { Left = 12, Top = 12, Width = 440, Height = 210 };
+        const int contentWidth = 440;
+        var (form, body) = DialogShell(title, contentWidth);
+        using var _ = form;
+        var list = new ListBox { Width = contentWidth, Height = 210 };
         list.Items.AddRange(options.ToArray());
         if (options.Count > 0) list.SelectedIndex = 0;
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Left = 276, Top = 234, Width = 80 };
-        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 372, Top = 234, Width = 80 };
-        form.Controls.AddRange([list, ok, cancel]);
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel };
+        body.Controls.Add(list);
+        body.Controls.Add(ButtonRow(cancel, ok));
         form.AcceptButton = ok;
+        form.CancelButton = cancel;
         return form.ShowDialog(owner) == DialogResult.OK ? list.SelectedItem as string : null;
     }
 
@@ -698,16 +741,19 @@ public static class Dialogs
     /// 20-sekuendiges Leerlauf-Zeitlimit je Datenblock als zweite Absicherung).</summary>
     public static async Task InstallBepInExAsync(IWin32Window owner, GameInstall game)
     {
-        using var form = new Form
+        const int contentWidth = 440;
+        var (form, body) = DialogShell("Installing BepInEx", contentWidth, controlBox: false);
+        using var _ = form;
+        // Mindesthoehe, damit der Dialog nicht bei jeder Statusmeldung springt; MaximumSize-Breite,
+        // damit die lange Schlussmeldung umbricht statt abgeschnitten zu werden.
+        var status = new Label
         {
-            Text = "Installing BepInEx", Width = 480, Height = 160,
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MinimizeBox = false, MaximizeBox = false, ControlBox = false
+            Text = "Starting…", AutoSize = true,
+            MaximumSize = new Size(contentWidth, 0), MinimumSize = new Size(contentWidth, 60)
         };
-        var status = new Label { Left = 12, Top = 16, Width = 440, Height = 60, Text = "Starting…" };
-        var cancel = new Button { Text = "Cancel", Left = 380, Top = 84, Width = 80 };
-        form.Controls.AddRange([status, cancel]);
+        var cancel = new Button { Text = "Cancel" };
+        body.Controls.Add(status);
+        body.Controls.Add(ButtonRow(cancel));
 
         using var cts = new CancellationTokenSource();
         cancel.Click += (_, _) => { status.Text = "Cancelling…"; cancel.Enabled = false; cts.Cancel(); };
