@@ -1,5 +1,9 @@
 # STFC Mod Manager
 
+[![build](https://github.com/trcyberoptic/stfc-modmanager/actions/workflows/build.yml/badge.svg)](https://github.com/trcyberoptic/stfc-modmanager/actions/workflows/build.yml)
+[![latest release](https://img.shields.io/github/v/release/trcyberoptic/stfc-modmanager)](https://github.com/trcyberoptic/stfc-modmanager/releases/latest)
+[![license: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+
 A small Windows app that installs, updates and toggles [BepInEx](https://github.com/BepInEx/BepInEx)
 mods for **Star Trek Fleet Command**, and can put together a redacted support
 package when something goes wrong.
@@ -52,6 +56,52 @@ single self-contained file.
 
 The executable is not code-signed, so Windows SmartScreen will warn on first
 run: click *More info*, then *Run anyway*.
+
+**You need:** 64-bit Windows 10 or 11, and Star Trek Fleet Command installed
+through its own launcher. Nothing else — no .NET, no Visual C++ runtime, no
+admin rights, as long as the game is not installed somewhere only an
+administrator can write to.
+
+## Using it
+
+**Close the game first.** Windows keeps mod files locked while it runs, so
+every button that changes something is greyed out until you quit. The window
+tells you when that is the case, and re-enables itself on its own once the
+game exits — you do not need to restart the manager.
+
+1. **Start it.** It finds your game folder by itself. If it cannot, it asks
+   you to point at the folder containing `prime.exe`, normally
+   `…\STFC\default\game`.
+2. **Install the runtime**, if the header says BepInEx is missing. One button,
+   about 33 MB. Mods cannot load without it.
+3. **Add a mod** — *Add from GitHub…* with the address of the mod's repository,
+   or *Add local…* for a `.zip` or `.dll` you already have. The first time you
+   use a given repository you get one confirmation dialog listing exactly what
+   will be written where; check it, because that is the moment to say no.
+4. **Start the game normally**, through its own launcher.
+
+The **first game start after installing or updating the runtime takes several
+minutes.** BepInEx is generating files it needs, once. It looks like a hang
+and is not one — let it finish.
+
+If mods are already installed by hand, the manager picks them up on first
+start instead of installing a second copy beside them. Existing configs are
+left alone.
+
+### When something goes wrong
+
+Open the **Problems** tab. It lists what the manager can see for itself —
+missing dependencies, mods built against an older game build, errors the game
+logged on its last run — usually with what to do about each.
+
+If you need help from someone else, *Generate support package* collects the
+logs, your mod list and your configs into one zip in your Downloads folder. API keys,
+tokens, e-mail addresses and player IDs are stripped out before it is written,
+so it is safe to share — but it does contain folder paths and your Windows
+user name, and the dialog says so before it writes anything.
+
+If a mod broke your game, disabling it takes one click and does not delete
+anything.
 
 ## Safety
 
