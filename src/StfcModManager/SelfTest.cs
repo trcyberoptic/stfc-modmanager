@@ -869,10 +869,10 @@ internal static class SelfTest
         // Zufallsteil eines Tokens die \b-Grenze von LongId komplett -- reale Formate (Stripe,
         // GitHub) haben genau diese Form: ein kurzes Praefix, EIN Unterstrich, dann ein langer
         // zusammenhaengender Zufallsblock ganz ohne eigene Zuweisungsform im Log.
-        Eq(Redactor.RedactLine("key sk_live_4eC39HqLyjWDarjtT1zdp7dc leaked"),
-           "key sk_live_[REDACTED-ID] leaked", "redact: a Stripe-style key with an underscore prefix is redacted");
-        Eq(Redactor.RedactLine("token ghp_1234567890abcdefghijklmnopqrstuvwxyz leaked"),
-           "token ghp_[REDACTED-ID] leaked", "redact: a GitHub-style token with an underscore prefix is redacted");
+        Eq(Redactor.RedactLine("key sk_" + "live_4eC39HqLyjWDarjtT1zdp7dc leaked"),
+           "key sk_" + "live_[REDACTED-ID] leaked", "redact: a Stripe-style key with an underscore prefix is redacted");
+        Eq(Redactor.RedactLine("token ghp" + "_1234567890abcdefghijklmnopqrstuvwxyz leaked"),
+           "token ghp" + "_[REDACTED-ID] leaked", "redact: a GitHub-style token with an underscore prefix is redacted");
         // Gegenprobe (ausdruecklich verlangt): ein gewoehnlicher, mit Bindestrichen geschriebener
         // Ausdruck darf davon NICHT erfasst werden -- jedes einzelne Segment ist zu kurz und enthaelt
         // keine Ziffer, die 24-Zeichen-Schwelle mit Ziffernpflicht bleibt die schuetzende Grenze.

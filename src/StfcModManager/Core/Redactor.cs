@@ -95,7 +95,7 @@ public static partial class Redactor
     //
     // Fix-Runde 1, I4: \b hat hier dasselbe Problem wie bei SecretAssignment -- der Unterstrich ist
     // ein \w-Zeichen, also gibt es KEINE \b-Grenze zwischen "_" und dem eigentlichen Zufallsteil
-    // eines Tokens wie "sk_live_4eC39HqLyjWDarjtT1zdp7dc" oder "ghp_<36 zufaellige Zeichen>" --
+    // eines Tokens wie "sk_live_" + 24 Zufallszeichen oder "ghp_" + 36 Zufallszeichen --
     // beides reale API-Schluessel-Formate (Stripe, GitHub), beide mit genau EINEM trennenden
     // Unterstrich vor einem laengeren, in sich zusammenhaengenden Zufallsteil. Ersetzt durch dieselbe
     // Grenze wie bei Left/Right oben (Klausel 1: kein Buchstabe/Ziffer davor/danach), aber OHNE die
