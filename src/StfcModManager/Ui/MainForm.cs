@@ -6,11 +6,19 @@ namespace StfcModManager.Ui;
 /// bei einem Fenster uebersichtlicher als zwei Dateien.</summary>
 public sealed class MainForm : Form
 {
-    private readonly Label _header = new() { Dock = DockStyle.Top, Height = 44, Padding = new Padding(8, 6, 8, 0) };
+    // Hoehe NICHT festnageln: die Kopfzeile ist zweizeilig, und Schriftgroesse/DPI/Pfadlaenge
+    // entscheiden, wie hoch das wirklich wird. Ein fester Wert schnitt die zweite Zeile ab.
+    private readonly Label _header = new() { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(8, 6, 8, 6) };
     private readonly TabControl _tabs = new() { Dock = DockStyle.Fill };
     private readonly ListView _mods = new() { Dock = DockStyle.Fill, View = View.Details, CheckBoxes = true, FullRowSelect = true };
     private readonly ListView _problems = new() { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true };
-    private readonly FlowLayoutPanel _buttons = new() { Dock = DockStyle.Bottom, Height = 76, Padding = new Padding(6) };
+    // Ebenfalls ohne feste Hoehe: die Knoepfe umbrechen je nach Fensterbreite in ein oder zwei
+    // Reihen, und bei 76 px war die zweite Reihe angeschnitten.
+    private readonly FlowLayoutPanel _buttons = new()
+    {
+        Dock = DockStyle.Bottom, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+        WrapContents = true, Padding = new Padding(6)
+    };
     private readonly Button _removeAllButton = new() { Text = "Remove all mods", AutoSize = true, Height = 28 };
 
     private AppState _state = new();
@@ -68,10 +76,13 @@ public sealed class MainForm : Form
         MinimumSize = new Size(720, 480);
         AllowDrop = true;
 
-        _mods.Columns.Add("Mod", 240);
+        // "Community Mod (version.dll)" ist der laengste Name, den wir selbst erzeugen, und passte
+        // bei 240 nicht -- die Spalte schnitt ihn mit "..." ab. Breiten so gewaehlt, dass sie
+        // zusammen die Vorgabebreite des Fensters fuellen.
+        _mods.Columns.Add("Mod", 300);
         _mods.Columns.Add("Version", 90);
         _mods.Columns.Add("Source", 260);
-        _mods.Columns.Add("Status", 220);
+        _mods.Columns.Add("Status", 240);
         _mods.ItemChecked += OnModChecked;
         _mods.MouseUp += OnModsMouseUp;
 
@@ -86,7 +97,11 @@ public sealed class MainForm : Form
         // zuerst hinzufuegen, dann Bottom -- dieselbe Reihenfolge, die im Hauptfenster (s. u.)
         // schon nachweislich funktioniert.
         _removeAllButton.Click += OnRemoveAllMods;
-        var problemsButtons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 40, Padding = new Padding(6) };
+        var problemsButtons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            WrapContents = true, Padding = new Padding(6)
+        };
         problemsButtons.Controls.Add(_removeAllButton);
         var problemsTab = new TabPage("Problems");
         problemsTab.Controls.Add(_problems);
@@ -429,6 +444,18 @@ public sealed class MainForm : Form
         return findings;
     }
 
+    /// <summary>
+    /// Kuerzt die BepInEx-Version fuer die Kopfzeile. Die volle ProductVersion haengt einen
+    /// 40-stelligen Commit-Hash an ("6.0.0-be.755+3fab71a19..."), der die Zeile sprengt und
+    /// einem Spieler nichts sagt. Support-Paket und Log bekommen weiterhin den vollen Wert.
+    /// </summary>
+    private static string ShortVersion(string? version)
+    {
+        if (string.IsNullOrWhiteSpace(version)) return "not installed";
+        var plus = version.IndexOf('+');
+        return plus > 0 ? version[..plus] : version;
+    }
+
     public void RefreshUi()
     {
         if (_game is null) return;
@@ -437,7 +464,7 @@ public sealed class MainForm : Form
         _header.Text =
             $"Game: {_game.Root}\r\n" +
             $"Client {GameLocator.ReadClientBuild(_game.Root)}  ·  " +
-            $"BepInEx {BepInExRuntime.Detect(_game) ?? "not installed"}  ·  " +
+            $"BepInEx {ShortVersion(BepInExRuntime.Detect(_game))}  ·  " +
             (running ? "game is RUNNING — changes are blocked" : "game not running");
 
         foreach (Control c in _buttons.Controls)
