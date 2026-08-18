@@ -264,3 +264,7 @@ FINAL: Roll back assessment confirmed and if anything understated — `ApplyPack
 FINAL: nothing in the repository must not be published — no secrets, tokens, usernames or developer paths. `.superpowers/` is untracked; add it to the repo `.gitignore` rather than relying on the nested tooling-generated one.
 
 PAUSED 2026-08-18 by the user after the final review. Resume point: one short fix round for the three must-fixes plus the README corrections, then re-run the self-test, then publish (repo creation, push, tag — the user approved this on 2026-08-16).
+
+POST-RELEASE 2026-08-18: the licence was changed from MIT to GNU GPL v3.0 at the user's
+request, after v0.1.1. The plan and the sections above still say MIT because that is what
+was decided and built at the time; `LICENSE` and `README.md` are authoritative.

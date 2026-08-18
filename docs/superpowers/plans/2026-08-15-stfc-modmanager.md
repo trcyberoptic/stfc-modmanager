@@ -3070,6 +3070,7 @@ jobs:
 - [ ] **Step 3: Lizenzdatei anlegen**
 
 `LICENSE` mit dem GPL-3.0-Text, Rechteinhaber `trcyberoptic`, Jahr 2026.
+*(Nachtrag 18.08.2026: nach v0.1.1 auf GNU GPL v3.0 gewechselt. `LICENSE` ist massgeblich.)*
 
 - [ ] **Step 4: Veröffentlichen**
 
