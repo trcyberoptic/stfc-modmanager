@@ -25,9 +25,20 @@ jobs:
       - name: Self-test
         shell: pwsh
         run: |
-          $output = & dotnet run --project src/StfcModManager/StfcModManager.csproj -c Release -- --selftest 2>&1
-          $exitCode = $LASTEXITCODE
-          $outputText = $output | Out-String
+          # `dotnet run` starts a GUI-subsystem child without inherited standard handles, so
+          # AttachConsole(-1) in Program.cs fails and NOTHING is captured -- 0 bytes back, exit
+          # code 0, and this whole step would silently no-op every time. `& $exe --selftest`
+          # doesn't work either: PowerShell does not wait for a GUI-subsystem process and
+          # $LASTEXITCODE comes back unset. Start-Process with explicit redirection and -Wait is
+          # the shape that actually captures AttachConsole(-1) output on a runner -- verified
+          # locally against this repository. This runs the already-built Release exe, so this
+          # step must come after the Build step above.
+          $exe = "src/StfcModManager/bin/Release/net10.0-windows/win-x64/StfcModManager.exe"
+          $o = "$env:RUNNER_TEMP/st-out.txt"; $e = "$env:RUNNER_TEMP/st-err.txt"
+          $proc = Start-Process -FilePath $exe -ArgumentList '--selftest' -NoNewWindow -PassThru -Wait `
+                                -RedirectStandardOutput $o -RedirectStandardError $e
+          $exitCode = $proc.ExitCode
+          $outputText = (Get-Content $o -Raw) + (Get-Content $e -Raw)
           Write-Host $outputText
 
           # Why this step does more than check $exitCode:

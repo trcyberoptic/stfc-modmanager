@@ -79,6 +79,17 @@ public static partial class Redactor
     [GeneratedRegex(@"[\w.+-]+@[\w-]+\.[\w.-]+", RegexOptions.CultureInvariant)]
     private static partial Regex Email();
 
+    // Deckt ein "Bearer <Token>" ab, das NICHT als Schluessel:Wert-Zeile auftritt -- z. B.
+    // "sending Bearer abc123 to the api" oder ein alleinstehendes "Bearer x" mitten im Fliesstext
+    // (dem Spec-eigenen Testfall). "Authorization: Bearer ..." wird bereits ueber SecretAssignment
+    // oben abgedeckt (das Schluesselwort "authorization" traegt die ganze Zeile), diese Regel ist
+    // die zweite, unabhaengige Verteidigungslinie fuer den Fall, dass "Bearer" gar nicht hinter
+    // einem der bekannten Schluesselwoerter steht. \S+ statt eines Laengen-/Zeichenklassen-Filters:
+    // ein Bearer-Token kann kurz sein ("Bearer x", s. o.), die 24-Zeichen-Schwelle von LongId greift
+    // dafuer nicht, und ein zu enger Zeichensatz wuerde ein Token mit Punkten (JWT) abschneiden.
+    [GeneratedRegex(@"\bBearer\s+\S+", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex BearerToken();
+
     // Mindestens 24 alphanumerische Zeichen mit wenigstens einer Ziffer:
     // trifft Spieler-uids, Sitzungstoken und Pruefsummen.
     //
@@ -116,6 +127,7 @@ public static partial class Redactor
         if (m.Success)
             return m.Groups["head"].Value + m.Groups["sep"].Value + "[REDACTED]";
 
+        line = BearerToken().Replace(line, "Bearer [REDACTED]");
         line = Email().Replace(line, "[REDACTED-EMAIL]");
         line = GuidLike().Replace(line, "[REDACTED-ID]");
         line = LongId().Replace(line, "[REDACTED-ID]");

@@ -130,11 +130,17 @@ public sealed class MainForm : Form
         // _gameStateTimer). Bewusst NICHT auf _busy geprueft: RefreshUi() selbst loest weder
         // Installer noch AppState.Save aus (nur HealthCheck.Run und ein Neuaufbau der ListView aus
         // dem bereits im Speicher stehenden _state), das ist also nicht dieselbe Race-Klasse wie
-        // Rescan() im Activated-Handler oder ein zweiter Klick auf einen asynchronen Knopf -- und
-        // selbst wenn der Tick waehrend einer Sperre feuert, gewinnt SetBusy(true)'s
-        // Panel-Deaktivierung ohnehin gegenueber dem, was RefreshUi() an einzelnen Buttons setzt
-        // (ein deaktivierter Container macht seine Kinder unbedienbar, unabhaengig von deren eigenem
-        // Enabled). Nur EIN RefreshUi()-Aufruf pro tatsaechlicher ZustandsAENDERUNG, nicht pro Tick.
+        // Rescan() im Activated-Handler oder ein zweiter Klick auf einen asynchronen Knopf.
+        //
+        // Release-Review-Korrektur: die urspruengliche Annahme hier -- ein Tick waehrend einer
+        // Sperre sei unschaedlich, weil SetBusy(true)'s Panel-Deaktivierung ohnehin gegenueber
+        // jedem einzeln gesetzten Enabled gewinnt -- stimmte fuer ACHT der neun Symbolleisten-
+        // Knoepfe (Kinder von _buttons), aber nicht fuer "Remove all mods": der haengt an einem
+        // eigenen Panel auf dem Problems-Tab, das SetBusy() nie deaktiviert (s. dort). Ein Tick
+        // waehrend einer Sperre setzte dessen Enabled also tatsaechlich zurueck auf bedienbar,
+        // mitten in einer laufenden Installer.Remove-Operation. RefreshUi() prueft
+        // _removeAllButton.Enabled deshalb jetzt explizit auch gegen _busy (s. dort). Nur EIN
+        // RefreshUi()-Aufruf pro tatsaechlicher ZustandsAENDERUNG, nicht pro Tick.
         _gameStateTimer.Tick += (_, _) =>
         {
             if (_game is null) return;
@@ -437,7 +443,14 @@ public sealed class MainForm : Form
         foreach (Control c in _buttons.Controls)
             c.Enabled = !running || c.Text.StartsWith("Generate") || c.Text.StartsWith("Change")
                                   || c.Text.StartsWith("Open");
-        _removeAllButton.Enabled = !running;
+
+        // Release-Review: _removeAllButton haengt (s. Feldkommentar bei _gameStateTimer und
+        // SetBusy) nicht an _buttons, dessen Container-Deaktivierung eine ZustandsAENDERUNG durch
+        // den Timer waehrend einer Sperre unschaedlich macht. Ohne "&& !_busy" hier setzte JEDER
+        // RefreshUi()-Aufruf -- auch der aus dem 2-Sekunden-_gameStateTimer-Tick, der unabhaengig
+        // von _busy feuert -- den Knopf zurueck auf bedienbar, MITTEN in einer laufenden
+        // Installer.Remove-Operation: SetBusy(true) hatte ihn gerade erst gesperrt.
+        _removeAllButton.Enabled = !running && !_busy;
 
         _suppressCheckEvents = true;
         _mods.Items.Clear();

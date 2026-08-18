@@ -783,6 +783,17 @@ internal static class SelfTest
         Eq(Redactor.RedactLine("Password=hunter2"), "Password=[REDACTED]", "redact: password");
         Eq(Redactor.RedactLine("Authorization: Bearer ey.J9.abc"), "Authorization: [REDACTED]",
            "redact: authorization header line");
+
+        // Release-Review: der einzige bisherige Assert oben passiert allein ueber die
+        // "authorization"-Schluesselwortregel (SecretAssignment) -- er wuerde identisch bestehen,
+        // gaebe es die BearerToken-Regel gar nicht, und beweist deshalb nichts ueber sie. Diese
+        // beiden Faelle haben KEINE Schluessel:Wert-Form und laufen nur ueber BearerToken selbst:
+        // ein alleinstehendes "Bearer x" (der Testfall aus der Aufgabenstellung) und ein
+        // Bearer-Token mitten im Fliesstext, ganz ohne "Authorization:"-Praefix.
+        Eq(Redactor.RedactLine("Bearer x"), "Bearer [REDACTED]",
+           "redact: standalone 'Bearer x' outside any key:value form");
+        Eq(Redactor.RedactLine("sending Bearer abc123 to the api"), "sending Bearer [REDACTED] to the api",
+           "redact: 'Bearer' token mid-sentence, outside any key:value form");
         Eq(Redactor.RedactLine("contact me at a.b+c@example.com now"),
            "contact me at [REDACTED-EMAIL] now", "redact: email");
         Eq(Redactor.RedactLine("user jd73d2aac9f4b81e5c6a7d8e9f01 logged in"),

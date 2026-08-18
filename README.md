@@ -14,7 +14,9 @@ package when something goes wrong.
   latest".
 - **Adds mods from three sources**: a GitHub repository's latest release, a
   local `.zip`/`.dll` file, or a `LocalMods` folder that sits next to the
-  executable and is scanned automatically.
+  executable. `LocalMods` isn't scanned automatically — it's simply where the
+  "Add local…" file picker starts, so you have a fixed place to drop files
+  before installing them.
 - **Adopts mods you already installed by hand**, instead of fighting them or
   installing a duplicate copy next to them. This includes mods placed in
   subfolders under `BepInEx\plugins` and mods that are currently disabled.
@@ -33,11 +35,13 @@ package when something goes wrong.
   BepInEx configs, and basic environment data, collected into a zip. API
   keys, tokens, e-mail addresses and player IDs are stripped out
   automatically before anything is written to disk.
-- **Verifies every download.** Mod and runtime downloads are checked against
-  the SHA-256 digest GitHub publishes for the release asset before the
-  manager touches your game folder with them.
-- **Updates itself.** New versions of the manager replace its own running
-  executable atomically — no separate installer, no leftover temp copies.
+- **Verifies mod downloads.** Mods downloaded from a GitHub release are
+  checked against the SHA-256 digest GitHub publishes for that release asset
+  before the manager touches your game folder with them. The BepInEx runtime
+  comes from `builds.bepinex.dev` instead of GitHub, which doesn't publish a
+  digest for it — that download is instead restricted to the pinned host over
+  HTTPS, follows no redirects, and is checked for a matching `Content-Length`
+  and a minimum size, but not against a hash.
 
 ## Install
 
@@ -67,6 +71,12 @@ run: click *More info*, then *Run anyway*.
 - **Auto-update is off by default**, both for the manager itself and for
   individual mods — nothing updates without you asking it to, unless you
   turn it on.
+- **Every file an install or update replaces is kept**, not overwritten in
+  place: it's moved into `%LOCALAPPDATA%\StfcModManager\backup\`, mirroring
+  the game folder's own structure, and kept there for 30 days. There is
+  deliberately no "Roll back" button in the app — restoring a file is a
+  manual copy from that backup folder back into your game folder — but the
+  files needed to undo a bad update by hand are always there.
 
 None of this changes the fact that **mods run inside the game process**. The
 manager can stop a bad *package* from ever reaching disk, but it cannot
@@ -87,6 +97,14 @@ dotnet publish src/StfcModManager/StfcModManager.csproj -c Release -o publish
 any failure — this is also what CI runs on every push and pull request. The
 `publish` command above produces a single self-contained `win-x64` file,
 `publish\StfcModManager.exe`, with no external runtime dependency.
+
+Because this is a `WinExe` (a GUI-subsystem executable), running `dotnet run
+--project src/StfcModManager/StfcModManager.csproj -- --selftest` from a
+terminal prints nothing — `dotnet run` launches it as a child process without
+inherited standard handles, so the app's own `AttachConsole` call has nothing
+to attach to. This is expected, not a hang: the exit code is authoritative
+(0 = every assert passed), so check `$LASTEXITCODE` (PowerShell) or `$?`
+(bash) after the command instead of watching for output.
 
 This repository ships a repo-local `nuget.config` that points at nuget.org.
 It exists because the project itself references no NuGet packages, but the
