@@ -68,9 +68,10 @@ run: click *More info*, then *Run anyway*.
 - **Every new GitHub repository must be confirmed once**, before install: a
   dialog shows the exact release asset, its size, its SHA-256 hash, and the
   full list of files that will be written into your game folder.
-- **Auto-update is off by default**, both for the manager itself and for
-  individual mods — nothing updates without you asking it to, unless you
-  turn it on.
+- **Nothing ever updates itself.** Mods are only ever downloaded and
+  installed when you click to do it, and the manager does not update itself
+  at all. There is no automatic-update setting to leave switched on by
+  mistake.
 - **Every file an install or update replaces is kept**, not overwritten in
   place: it's moved into `%LOCALAPPDATA%\StfcModManager\backup\`, mirroring
   the game folder's own structure, and kept there for 30 days. There is
