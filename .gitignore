@@ -10,3 +10,6 @@ LocalMods/
 .remember/
 .serena/
 .superpowers/
+
+# Local assistant instructions, not part of the published project
+CLAUDE.md
